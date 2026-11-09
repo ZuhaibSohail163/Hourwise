@@ -18,7 +18,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 hourwise \
-    && mkdir -p /data/uploads && chown -R hourwise /data
+    && mkdir -p /data/uploads /data/db && chown -R hourwise /data
 
 COPY --from=builder /app/target/release/hourwise-backend /usr/local/bin/hourwise-backend
 

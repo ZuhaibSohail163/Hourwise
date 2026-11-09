@@ -5,11 +5,14 @@ use axum::{
     Json, Router,
 };
 use chrono::{Datelike, Duration, NaiveDate, Utc};
+use libsql::Connection;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
+    args,
     auth::{hash_password, validate_password, AdminUser},
+    db,
     error::{AppError, AppResult},
     models::{
         Project, ProjectMember, ProjectSummary, TimeEntryView, User, UserProject, UserWithStats,
@@ -39,6 +42,17 @@ pub fn router() -> Router<AppState> {
         .route("/time-entries", get(list_entries))
 }
 
+fn email_conflict(e: AppError) -> AppError {
+    match e {
+        AppError::Conflict(_) => AppError::Conflict("A user with that email already exists".into()),
+        other => other,
+    }
+}
+
+async fn exists(conn: &Connection, sql: &str, id: Uuid) -> AppResult<bool> {
+    Ok(db::query_value(conn, sql, args![id]).await?.is_some())
+}
+
 // ---------------------------------------------------------------- stats
 
 #[derive(Serialize)]
@@ -52,69 +66,83 @@ pub struct Stats {
     minutes_this_month: i64,
 }
 
+/// Start of the (Monday-based) week and of the month containing `today`.
+pub fn period_starts(today: NaiveDate) -> (NaiveDate, NaiveDate) {
+    let week_start = today - Duration::days(i64::from(today.weekday().num_days_from_monday()));
+    let month_start = today.with_day(1).unwrap_or(today);
+    (week_start, month_start)
+}
+
 async fn stats(State(state): State<AppState>, _admin: AdminUser) -> AppResult<Json<Stats>> {
     let today = Utc::now().date_naive();
-    let week_start = today - Duration::days(today.weekday().num_days_from_monday() as i64);
-    let month_start = today.with_day(1).unwrap_or(today);
+    let (week_start, month_start) = period_starts(today);
+    let conn = state.db.conn().await?;
 
-    let (users, active_users): (i64, i64) =
-        sqlx::query_as("SELECT COUNT(*), COUNT(*) FILTER (WHERE is_active) FROM users")
-            .fetch_one(&state.db)
-            .await?;
-    let (projects, active_projects): (i64, i64) =
-        sqlx::query_as("SELECT COUNT(*), COUNT(*) FILTER (WHERE NOT is_archived) FROM projects")
-            .fetch_one(&state.db)
-            .await?;
-    let (minutes_today, minutes_this_week, minutes_this_month): (i64, i64, i64) = sqlx::query_as(
-        "SELECT
-            COALESCE(SUM(minutes) FILTER (WHERE entry_date = $1), 0)::BIGINT,
-            COALESCE(SUM(minutes) FILTER (WHERE entry_date >= $2), 0)::BIGINT,
-            COALESCE(SUM(minutes) FILTER (WHERE entry_date >= $3), 0)::BIGINT
-         FROM time_entries WHERE entry_date >= LEAST($2, $3) AND entry_date <= $1",
+    let users = db::query_records(
+        &conn,
+        "SELECT COUNT(*) AS total, COALESCE(SUM(is_active), 0) AS active FROM users",
+        args![],
     )
-    .bind(today)
-    .bind(week_start)
-    .bind(month_start)
-    .fetch_one(&state.db)
     .await?;
+    let projects = db::query_records(
+        &conn,
+        "SELECT COUNT(*) AS total, COALESCE(SUM(1 - is_archived), 0) AS active FROM projects",
+        args![],
+    )
+    .await?;
+    let minutes = db::query_records(
+        &conn,
+        "SELECT
+            COALESCE(SUM(CASE WHEN entry_date = ?1 THEN minutes END), 0) AS today,
+            COALESCE(SUM(CASE WHEN entry_date >= ?2 THEN minutes END), 0) AS week,
+            COALESCE(SUM(CASE WHEN entry_date >= ?3 THEN minutes END), 0) AS month
+         FROM time_entries WHERE entry_date >= ?4 AND entry_date <= ?1",
+        args![today, week_start, month_start, week_start.min(month_start)],
+    )
+    .await?;
+    let (Some(u), Some(p), Some(m)) = (users.first(), projects.first(), minutes.first()) else {
+        return Err(AppError::Internal(
+            "aggregate query returned no rows".into(),
+        ));
+    };
 
     Ok(Json(Stats {
-        users,
-        active_users,
-        projects,
-        active_projects,
-        minutes_today,
-        minutes_this_week,
-        minutes_this_month,
+        users: u.i64("total")?,
+        active_users: u.i64("active")?,
+        projects: p.i64("total")?,
+        active_projects: p.i64("active")?,
+        minutes_today: m.i64("today")?,
+        minutes_this_week: m.i64("week")?,
+        minutes_this_month: m.i64("month")?,
     }))
 }
 
 // ---------------------------------------------------------------- users
 
+const USER_STATS_SELECT: &str = "
+SELECT u.*,
+    (SELECT COUNT(*) FROM project_members pm WHERE pm.user_id = u.id) AS project_count,
+    (SELECT COALESCE(SUM(te.minutes), 0) FROM time_entries te WHERE te.user_id = u.id) AS total_minutes
+FROM users u
+";
+
 async fn list_users(
     State(state): State<AppState>,
     _admin: AdminUser,
 ) -> AppResult<Json<Vec<UserWithStats>>> {
-    let users = sqlx::query_as::<_, UserWithStats>(
-        "SELECT u.*,
-            (SELECT COUNT(*) FROM project_members pm WHERE pm.user_id = u.id) AS project_count,
-            (SELECT COALESCE(SUM(te.minutes), 0)::BIGINT FROM time_entries te WHERE te.user_id = u.id) AS total_minutes
-         FROM users u
-         ORDER BY u.is_active DESC, lower(u.name)",
-    )
-    .fetch_all(&state.db)
-    .await?;
-    Ok(Json(users))
+    let conn = state.db.conn().await?;
+    let sql = format!("{USER_STATS_SELECT} ORDER BY u.is_active DESC, lower(u.name)");
+    Ok(Json(db::query_all(&conn, &sql, args![]).await?))
 }
 
-fn validate_role(role: &str) -> AppResult<()> {
+pub fn validate_role(role: &str) -> AppResult<()> {
     if role != ROLE_ADMIN && role != ROLE_MEMBER {
         return Err(AppError::bad("Role must be `admin` or `member`"));
     }
     Ok(())
 }
 
-fn validate_name(name: &str) -> AppResult<String> {
+pub fn validate_name(name: &str) -> AppResult<String> {
     let name = name.trim().to_string();
     if name.is_empty() || name.chars().count() > 100 {
         return Err(AppError::bad("Name must be between 1 and 100 characters"));
@@ -122,7 +150,7 @@ fn validate_name(name: &str) -> AppResult<String> {
     Ok(name)
 }
 
-fn normalize_email(email: &str) -> AppResult<String> {
+pub fn normalize_email(email: &str) -> AppResult<String> {
     let email = email.trim().to_lowercase();
     if !valid_email(&email) {
         return Err(AppError::bad("Please enter a valid email address"));
@@ -155,31 +183,36 @@ async fn create_user(
     validate_role(&role)?;
     validate_password(&body.password)?;
     let hash = hash_password(body.password).await?;
+    let now = db::now_ts();
 
-    let mut tx = state.db.begin().await?;
-    let user = sqlx::query_as::<_, User>(
-        "INSERT INTO users (id, email, name, password_hash, role, job_title)
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *",
+    let conn = state.db.conn().await?;
+    let tx = db::write_tx(&conn).await?;
+    let user: User = db::query_one(
+        &tx,
+        "INSERT INTO users (id, email, name, password_hash, role, job_title, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) RETURNING *",
+        args![
+            Uuid::new_v4(),
+            &email,
+            name,
+            hash,
+            role,
+            clean(body.job_title),
+            &now
+        ],
     )
-    .bind(Uuid::new_v4())
-    .bind(&email)
-    .bind(name)
-    .bind(hash)
-    .bind(role)
-    .bind(clean(body.job_title))
-    .fetch_one(&mut *tx)
     .await
-    .map_err(|e| match AppError::from(e) {
-        AppError::Conflict(_) => AppError::Conflict("A user with that email already exists".into()),
-        other => other,
-    })?;
+    .map_err(email_conflict)?;
     for project_id in body.project_ids {
-        sqlx::query(
-            "INSERT INTO project_members (project_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        if !exists(&tx, "SELECT 1 FROM projects WHERE id = ?1", project_id).await? {
+            return Err(AppError::bad("Referenced record does not exist"));
+        }
+        db::execute(
+            &tx,
+            "INSERT INTO project_members (project_id, user_id, added_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT DO NOTHING",
+            args![project_id, user.id, &now],
         )
-        .bind(project_id)
-        .bind(user.id)
-        .execute(&mut *tx)
         .await?;
     }
     tx.commit().await?;
@@ -197,28 +230,23 @@ async fn get_user(
     _admin: AdminUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<UserDetail>> {
-    let user = sqlx::query_as::<_, UserWithStats>(
-        "SELECT u.*,
-            (SELECT COUNT(*) FROM project_members pm WHERE pm.user_id = u.id) AS project_count,
-            (SELECT COALESCE(SUM(te.minutes), 0)::BIGINT FROM time_entries te WHERE te.user_id = u.id) AS total_minutes
-         FROM users u WHERE u.id = $1",
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| AppError::not_found("User"))?;
+    let conn = state.db.conn().await?;
+    let sql = format!("{USER_STATS_SELECT} WHERE u.id = ?1");
+    let user: UserWithStats = db::query_opt(&conn, &sql, args![id])
+        .await?
+        .ok_or_else(|| AppError::not_found("User"))?;
 
-    let projects = sqlx::query_as::<_, UserProject>(
+    let projects = db::query_all(
+        &conn,
         "SELECT p.*, pm.added_at,
-            (SELECT COALESCE(SUM(te.minutes), 0)::BIGINT FROM time_entries te
-              WHERE te.project_id = p.id AND te.user_id = $1) AS total_minutes
+            (SELECT COALESCE(SUM(te.minutes), 0) FROM time_entries te
+              WHERE te.project_id = p.id AND te.user_id = ?1) AS total_minutes
          FROM project_members pm
          JOIN projects p ON p.id = pm.project_id
-         WHERE pm.user_id = $1
+         WHERE pm.user_id = ?1
          ORDER BY p.is_archived, lower(p.name)",
+        args![id],
     )
-    .bind(id)
-    .fetch_all(&state.db)
     .await?;
 
     Ok(Json(UserDetail { user, projects }))
@@ -241,9 +269,8 @@ async fn update_user(
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateUser>,
 ) -> AppResult<Json<User>> {
-    let existing = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&state.db)
+    let conn = state.db.conn().await?;
+    let existing: User = db::query_opt(&conn, "SELECT * FROM users WHERE id = ?1", args![id])
         .await?
         .ok_or_else(|| AppError::not_found("User"))?;
 
@@ -269,6 +296,7 @@ async fn update_user(
         ));
     }
 
+    let password_reset = body.password.as_deref().is_some_and(|p| !p.is_empty());
     let password_hash = match body.password {
         Some(p) if !p.is_empty() => {
             validate_password(&p)?;
@@ -276,29 +304,36 @@ async fn update_user(
         }
         _ => existing.password_hash.clone(),
     };
+    // A password reset or deactivation signs the user out everywhere.
+    let revoke = password_reset || (existing.is_active && !is_active);
+    let session_epoch = existing.session_epoch + i64::from(revoke);
 
-    let updated = sqlx::query_as::<_, User>(
+    let updated = db::query_one(
+        &conn,
         "UPDATE users
-         SET email = $2, name = $3, role = $4, is_active = $5, job_title = $6,
-             password_hash = $7, updated_at = now()
-         WHERE id = $1 RETURNING *",
+         SET email = ?2, name = ?3, role = ?4, is_active = ?5, job_title = ?6,
+             password_hash = ?7, updated_at = ?8, session_epoch = ?9
+         WHERE id = ?1 RETURNING *",
+        args![
+            id,
+            email,
+            name,
+            role,
+            is_active,
+            job_title,
+            password_hash,
+            db::now_ts(),
+            session_epoch
+        ],
     )
-    .bind(id)
-    .bind(email)
-    .bind(name)
-    .bind(role)
-    .bind(is_active)
-    .bind(job_title)
-    .bind(password_hash)
-    .fetch_one(&state.db)
     .await
-    .map_err(|e| match AppError::from(e) {
-        AppError::Conflict(_) => AppError::Conflict("A user with that email already exists".into()),
-        other => other,
-    })?;
+    .map_err(email_conflict)?;
     Ok(Json(updated))
 }
 
+/// Deletes a user and everything that belongs to them. The cascade is done explicitly (not via
+/// `ON DELETE CASCADE`) so it behaves the same on Turso Cloud, where the app does not depend on
+/// `PRAGMA foreign_keys` being enabled for the connection.
 async fn delete_user(
     State(state): State<AppState>,
     AdminUser(admin): AdminUser,
@@ -307,13 +342,25 @@ async fn delete_user(
     if admin.id == id {
         return Err(AppError::bad("You cannot delete your own account"));
     }
-    let result = sqlx::query("DELETE FROM users WHERE id = $1")
-        .bind(id)
-        .execute(&state.db)
-        .await?;
-    if result.rows_affected() == 0 {
+    let conn = state.db.conn().await?;
+    let tx = db::write_tx(&conn).await?;
+    db::execute(
+        &tx,
+        "DELETE FROM time_entries WHERE user_id = ?1",
+        args![id],
+    )
+    .await?;
+    db::execute(
+        &tx,
+        "DELETE FROM project_members WHERE user_id = ?1",
+        args![id],
+    )
+    .await?;
+    let affected = db::execute(&tx, "DELETE FROM users WHERE id = ?1", args![id]).await?;
+    if affected == 0 {
         return Err(AppError::not_found("User"));
     }
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -322,7 +369,7 @@ async fn delete_user(
 const PROJECT_SUMMARY_SELECT: &str = "
 SELECT p.*,
     (SELECT COUNT(*) FROM project_members pm WHERE pm.project_id = p.id) AS member_count,
-    (SELECT COALESCE(SUM(te.minutes), 0)::BIGINT FROM time_entries te WHERE te.project_id = p.id) AS total_minutes
+    (SELECT COALESCE(SUM(te.minutes), 0) FROM time_entries te WHERE te.project_id = p.id) AS total_minutes
 FROM projects p
 ";
 
@@ -330,11 +377,9 @@ async fn list_projects(
     State(state): State<AppState>,
     _admin: AdminUser,
 ) -> AppResult<Json<Vec<ProjectSummary>>> {
+    let conn = state.db.conn().await?;
     let sql = format!("{PROJECT_SUMMARY_SELECT} ORDER BY p.is_archived, lower(p.name)");
-    let projects = sqlx::query_as::<_, ProjectSummary>(&sql)
-        .fetch_all(&state.db)
-        .await?;
-    Ok(Json(projects))
+    Ok(Json(db::query_all(&conn, &sql, args![]).await?))
 }
 
 #[derive(Deserialize)]
@@ -346,7 +391,7 @@ pub struct ProjectInput {
     is_archived: Option<bool>,
 }
 
-fn validate_project_name(name: &str) -> AppResult<String> {
+pub fn validate_project_name(name: &str) -> AppResult<String> {
     let name = name.trim().to_string();
     if name.is_empty() || name.chars().count() > 120 {
         return Err(AppError::bad(
@@ -356,7 +401,7 @@ fn validate_project_name(name: &str) -> AppResult<String> {
     Ok(name)
 }
 
-fn validate_project_color(color: Option<String>, fallback: &str) -> AppResult<String> {
+pub fn validate_project_color(color: Option<String>, fallback: &str) -> AppResult<String> {
     let color = color.unwrap_or_else(|| fallback.to_string()).to_lowercase();
     if !valid_color(&color) {
         return Err(AppError::bad("Color must be a hex value like #f36c00"));
@@ -371,16 +416,20 @@ async fn create_project(
 ) -> AppResult<(StatusCode, Json<Project>)> {
     let name = validate_project_name(body.name.as_deref().unwrap_or(""))?;
     let color = validate_project_color(body.color, "#f36c00")?;
-    let project = sqlx::query_as::<_, Project>(
-        "INSERT INTO projects (id, name, client, description, color)
-         VALUES ($1, $2, $3, $4, $5) RETURNING *",
+    let conn = state.db.conn().await?;
+    let project = db::query_one(
+        &conn,
+        "INSERT INTO projects (id, name, client, description, color, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6) RETURNING *",
+        args![
+            Uuid::new_v4(),
+            name,
+            clean(body.client),
+            clean(body.description),
+            color,
+            db::now_ts()
+        ],
     )
-    .bind(Uuid::new_v4())
-    .bind(name)
-    .bind(clean(body.client))
-    .bind(clean(body.description))
-    .bind(color)
-    .fetch_one(&state.db)
     .await?;
     Ok((StatusCode::CREATED, Json(project)))
 }
@@ -396,24 +445,23 @@ async fn get_project(
     _admin: AdminUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<ProjectDetail>> {
-    let sql = format!("{PROJECT_SUMMARY_SELECT} WHERE p.id = $1");
-    let project = sqlx::query_as::<_, ProjectSummary>(&sql)
-        .bind(id)
-        .fetch_optional(&state.db)
+    let conn = state.db.conn().await?;
+    let sql = format!("{PROJECT_SUMMARY_SELECT} WHERE p.id = ?1");
+    let project: ProjectSummary = db::query_opt(&conn, &sql, args![id])
         .await?
         .ok_or_else(|| AppError::not_found("Project"))?;
 
-    let members = sqlx::query_as::<_, ProjectMember>(
+    let members = db::query_all(
+        &conn,
         "SELECT u.id, u.name, u.email, u.avatar_url, u.role, u.job_title, u.is_active, pm.added_at,
-            (SELECT COALESCE(SUM(te.minutes), 0)::BIGINT FROM time_entries te
-              WHERE te.user_id = u.id AND te.project_id = $1) AS total_minutes
+            (SELECT COALESCE(SUM(te.minutes), 0) FROM time_entries te
+              WHERE te.user_id = u.id AND te.project_id = ?1) AS total_minutes
          FROM project_members pm
          JOIN users u ON u.id = pm.user_id
-         WHERE pm.project_id = $1
+         WHERE pm.project_id = ?1
          ORDER BY lower(u.name)",
+        args![id],
     )
-    .bind(id)
-    .fetch_all(&state.db)
     .await?;
 
     Ok(Json(ProjectDetail { project, members }))
@@ -425,9 +473,8 @@ async fn update_project(
     Path(id): Path<Uuid>,
     Json(body): Json<ProjectInput>,
 ) -> AppResult<Json<Project>> {
-    let existing = sqlx::query_as::<_, Project>("SELECT * FROM projects WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&state.db)
+    let conn = state.db.conn().await?;
+    let existing: Project = db::query_opt(&conn, "SELECT * FROM projects WHERE id = ?1", args![id])
         .await?
         .ok_or_else(|| AppError::not_found("Project"))?;
 
@@ -446,34 +493,51 @@ async fn update_project(
     };
     let is_archived = body.is_archived.unwrap_or(existing.is_archived);
 
-    let project = sqlx::query_as::<_, Project>(
+    let project = db::query_one(
+        &conn,
         "UPDATE projects
-         SET name = $2, client = $3, description = $4, color = $5, is_archived = $6, updated_at = now()
-         WHERE id = $1 RETURNING *",
+         SET name = ?2, client = ?3, description = ?4, color = ?5, is_archived = ?6, updated_at = ?7
+         WHERE id = ?1 RETURNING *",
+        args![
+            id,
+            name,
+            client,
+            description,
+            color,
+            is_archived,
+            db::now_ts()
+        ],
     )
-    .bind(id)
-    .bind(name)
-    .bind(client)
-    .bind(description)
-    .bind(color)
-    .bind(is_archived)
-    .fetch_one(&state.db)
     .await?;
     Ok(Json(project))
 }
 
+/// Deletes a project together with its memberships and time entries (explicit cascade, see
+/// [`delete_user`]).
 async fn delete_project(
     State(state): State<AppState>,
     _admin: AdminUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<StatusCode> {
-    let result = sqlx::query("DELETE FROM projects WHERE id = $1")
-        .bind(id)
-        .execute(&state.db)
-        .await?;
-    if result.rows_affected() == 0 {
+    let conn = state.db.conn().await?;
+    let tx = db::write_tx(&conn).await?;
+    db::execute(
+        &tx,
+        "DELETE FROM time_entries WHERE project_id = ?1",
+        args![id],
+    )
+    .await?;
+    db::execute(
+        &tx,
+        "DELETE FROM project_members WHERE project_id = ?1",
+        args![id],
+    )
+    .await?;
+    let affected = db::execute(&tx, "DELETE FROM projects WHERE id = ?1", args![id]).await?;
+    if affected == 0 {
         return Err(AppError::not_found("Project"));
     }
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -488,21 +552,22 @@ async fn add_members(
     Path(id): Path<Uuid>,
     Json(body): Json<AddMembers>,
 ) -> AppResult<StatusCode> {
-    let exists: Option<Uuid> = sqlx::query_scalar("SELECT id FROM projects WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&state.db)
-        .await?;
-    if exists.is_none() {
+    let conn = state.db.conn().await?;
+    if !exists(&conn, "SELECT 1 FROM projects WHERE id = ?1", id).await? {
         return Err(AppError::not_found("Project"));
     }
-    let mut tx = state.db.begin().await?;
+    let now = db::now_ts();
+    let tx = db::write_tx(&conn).await?;
     for user_id in body.user_ids {
-        sqlx::query(
-            "INSERT INTO project_members (project_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        if !exists(&tx, "SELECT 1 FROM users WHERE id = ?1", user_id).await? {
+            return Err(AppError::bad("Referenced record does not exist"));
+        }
+        db::execute(
+            &tx,
+            "INSERT INTO project_members (project_id, user_id, added_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT DO NOTHING",
+            args![id, user_id, &now],
         )
-        .bind(id)
-        .bind(user_id)
-        .execute(&mut *tx)
         .await?;
     }
     tx.commit().await?;
@@ -515,11 +580,13 @@ async fn remove_member(
     _admin: AdminUser,
     Path((id, user_id)): Path<(Uuid, Uuid)>,
 ) -> AppResult<StatusCode> {
-    sqlx::query("DELETE FROM project_members WHERE project_id = $1 AND user_id = $2")
-        .bind(id)
-        .bind(user_id)
-        .execute(&state.db)
-        .await?;
+    let conn = state.db.conn().await?;
+    db::execute(
+        &conn,
+        "DELETE FROM project_members WHERE project_id = ?1 AND user_id = ?2",
+        args![id, user_id],
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -541,17 +608,78 @@ async fn list_entries(
     let (from, to) = date_range(q.from, q.to)?;
     let sql = format!(
         "{ENTRY_SELECT}
-         WHERE te.entry_date BETWEEN $1 AND $2
-           AND ($3::uuid IS NULL OR te.project_id = $3)
-           AND ($4::uuid IS NULL OR te.user_id = $4)
+         WHERE te.entry_date BETWEEN ?1 AND ?2
+           AND (?3 IS NULL OR te.project_id = ?3)
+           AND (?4 IS NULL OR te.user_id = ?4)
          ORDER BY te.entry_date DESC, lower(u.name), te.created_at DESC"
     );
-    let entries = sqlx::query_as::<_, TimeEntryView>(&sql)
-        .bind(from)
-        .bind(to)
-        .bind(q.project_id)
-        .bind(q.user_id)
-        .fetch_all(&state.db)
-        .await?;
+    let conn = state.db.conn().await?;
+    let entries = db::query_all(&conn, &sql, args![from, to, q.project_id, q.user_id]).await?;
     Ok(Json(entries))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn day(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap_or_default()
+    }
+
+    #[test]
+    fn weeks_start_on_monday_and_months_on_the_first() {
+        // 2026-11-09 is a Monday.
+        assert_eq!(
+            period_starts(day("2026-11-09")),
+            (day("2026-11-09"), day("2026-11-01"))
+        );
+        // Sunday belongs to the week that started the previous Monday.
+        assert_eq!(
+            period_starts(day("2026-11-15")),
+            (day("2026-11-09"), day("2026-11-01"))
+        );
+        // A week can start in the previous month (and year).
+        assert_eq!(
+            period_starts(day("2027-01-01")),
+            (day("2026-12-28"), day("2027-01-01"))
+        );
+        assert_eq!(
+            period_starts(day("2024-02-29")),
+            (day("2024-02-26"), day("2024-02-01"))
+        );
+    }
+
+    #[test]
+    fn user_field_validation() {
+        assert!(validate_role("admin").is_ok());
+        assert!(validate_role("member").is_ok());
+        assert!(validate_role("Admin").is_err());
+        assert!(validate_role("owner").is_err());
+        assert_eq!(validate_name("  Ada  ").ok().as_deref(), Some("Ada"));
+        assert!(validate_name("   ").is_err());
+        assert!(validate_name(&"x".repeat(101)).is_err());
+        assert_eq!(
+            normalize_email("  Ada@Example.COM ").ok().as_deref(),
+            Some("ada@example.com")
+        );
+        assert!(normalize_email("not-an-email").is_err());
+    }
+
+    #[test]
+    fn project_field_validation() {
+        assert!(validate_project_name("").is_err());
+        assert!(validate_project_name(&"p".repeat(121)).is_err());
+        assert_eq!(
+            validate_project_color(Some("#ABCDEF".into()), "#000000")
+                .ok()
+                .as_deref(),
+            Some("#abcdef")
+        );
+        assert_eq!(
+            validate_project_color(None, "#f36c00").ok().as_deref(),
+            Some("#f36c00")
+        );
+        assert!(validate_project_color(Some("red".into()), "#000000").is_err());
+        assert!(validate_project_color(Some("#12345g".into()), "#000000").is_err());
+    }
 }

@@ -30,3 +30,16 @@ Thumbs.db
 # ---- Misc ----
 coverage/
 *.log
+
+# Local libSQL / SQLite databases and backups (may contain employee data)
+backend/data/
+*.db
+*.db-wal
+*.db-shm
+backups/
+*.backup.sql
+
+# Playwright
+frontend/test-results/
+frontend/playwright-report/
+frontend/blob-report/

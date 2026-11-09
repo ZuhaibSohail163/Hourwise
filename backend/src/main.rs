@@ -1,128 +1,165 @@
-mod auth;
-mod config;
-mod error;
-mod models;
-mod routes;
+//! `hourwise-backend` binary.
+//!
+//! ```text
+//! hourwise-backend                 # run the API server (default)
+//! hourwise-backend serve           # same
+//! hourwise-backend migrate         # apply pending migrations and exit
+//! hourwise-backend check-db        # test connectivity + credentials and exit
+//! hourwise-backend verify          # data-integrity report (exit code 1 on problems)
+//! hourwise-backend backup <file>   # write a logical SQL backup (use `-` for stdout)
+//! hourwise-backend restore <file>  # restore a backup into an EMPTY database
+//! ```
 
-use std::{sync::Arc, time::Duration};
+use std::process::ExitCode;
 
-use axum::{
-    extract::DefaultBodyLimit,
-    http::{
-        header::{AUTHORIZATION, CONTENT_TYPE},
-        HeaderValue, Method,
-    },
-    Router,
-};
-use sqlx::{postgres::PgPoolOptions, PgPool};
-use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
+use hourwise_backend::{backup, config, db, migrate};
 use tracing_subscriber::EnvFilter;
-use uuid::Uuid;
 
-use crate::config::Config;
-
-#[derive(Clone)]
-pub struct AppState {
-    pub db: PgPool,
-    pub config: Arc<Config>,
+fn usage() -> ExitCode {
+    eprintln!(
+        "usage: hourwise-backend [serve | migrate | check-db | verify | backup <file|-> | restore <file>]"
+    );
+    ExitCode::from(2)
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     let _ = dotenvy::dotenv();
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new("hourwise_backend=info,tower_http=info")),
         )
+        .with_writer(std::io::stderr)
         .init();
 
-    let config = Config::from_env();
-
-    let db = PgPoolOptions::new()
-        .max_connections(10)
-        .acquire_timeout(Duration::from_secs(10))
-        .connect(&config.database_url)
-        .await
-        .expect("failed to connect to the database");
-
-    sqlx::migrate!("./migrations")
-        .run(&db)
-        .await
-        .expect("failed to run database migrations");
-
-    std::fs::create_dir_all(format!("{}/avatars", config.upload_dir))
-        .expect("failed to create upload directory");
-
-    seed_admin(&db, &config).await;
-
-    let state = AppState {
-        db,
-        config: Arc::new(config.clone()),
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let command = args.first().map(String::as_str).unwrap_or("serve");
+    let result = match command {
+        "serve" => serve().await,
+        "migrate" | "check-db" | "verify" | "backup" | "restore" => {
+            db_command(command, args.get(1).map(String::as_str)).await
+        }
+        "-h" | "--help" | "help" => {
+            usage();
+            return ExitCode::SUCCESS;
+        }
+        _ => return usage(),
     };
-
-    let mut app = Router::new()
-        .nest("/api", routes::router())
-        .nest_service("/uploads", ServeDir::new(&config.upload_dir))
-        .layer(DefaultBodyLimit::max(5 * 1024 * 1024))
-        .layer(TraceLayer::new_for_http());
-
-    if let Some(origin) = &config.cors_origin {
-        let origin: HeaderValue = origin.parse().expect("CORS_ORIGIN is not a valid origin");
-        app = app.layer(
-            CorsLayer::new()
-                .allow_origin(origin)
-                .allow_methods([
-                    Method::GET,
-                    Method::POST,
-                    Method::PUT,
-                    Method::PATCH,
-                    Method::DELETE,
-                ])
-                .allow_headers([AUTHORIZATION, CONTENT_TYPE]),
-        );
+    match result {
+        Ok(code) => code,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            ExitCode::FAILURE
+        }
     }
-
-    let app = app.with_state(state);
-
-    let listener = tokio::net::TcpListener::bind(&config.bind_addr)
-        .await
-        .expect("failed to bind address");
-    tracing::info!("Hourwise API listening on {}", config.bind_addr);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
-        .expect("server error");
 }
 
-/// Creates the first admin account from ADMIN_EMAIL / ADMIN_PASSWORD when the
-/// database has no admin yet. Safe to run on every start.
-async fn seed_admin(db: &PgPool, config: &Config) {
-    let (Some(email), Some(password)) = (&config.admin_email, &config.admin_password) else {
-        return;
-    };
-    let admins: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role = 'admin'")
-        .fetch_one(db)
+async fn serve() -> Result<ExitCode, String> {
+    let config = config::Config::from_env();
+    let bind_addr = config.bind_addr.clone();
+    // Retry for ~1 minute: Turso Cloud or the network may be briefly unavailable at boot.
+    let state = hourwise_backend::init_state(config, 12)
         .await
-        .expect("failed to count admins");
-    if admins > 0 {
-        return;
-    }
-    let hash = auth::hash_password(password.clone())
+        .map_err(|e| format!("startup failed: {}", e.detail()))?;
+    let app = hourwise_backend::app(state);
+
+    let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
-        .expect("failed to hash admin password");
-    sqlx::query(
-        "INSERT INTO users (id, email, name, password_hash, role) VALUES ($1, $2, $3, $4, 'admin')
-         ON CONFLICT (email) DO UPDATE SET role = 'admin', is_active = TRUE",
+        .map_err(|e| format!("failed to bind {bind_addr}: {e}"))?;
+    tracing::info!("Hourwise API listening on {bind_addr}");
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .bind(Uuid::new_v4())
-    .bind(email)
-    .bind(&config.admin_name)
-    .bind(hash)
-    .execute(db)
+    .with_graceful_shutdown(shutdown_signal())
     .await
-    .expect("failed to create the initial admin");
-    tracing::info!("Created initial admin account {email}");
+    .map_err(|e| format!("server error: {e}"))?;
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            s.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
+
+async fn db_command(command: &str, arg: Option<&str>) -> Result<ExitCode, String> {
+    let target = config::database_from_env()?;
+    eprintln!("database: {}", target.describe());
+    let database = db::open_with_retry(&target, 3)
+        .await
+        .map_err(|e| format!("cannot connect: {}", e.detail()))?;
+    let err = |e: hourwise_backend::error::AppError| e.detail();
+
+    match command {
+        "check-db" => {
+            let conn = database.conn().await.map_err(err)?;
+            let applied = migrate::applied(&conn).await.map_err(err)?;
+            eprintln!(
+                "connection OK; {} of {} migrations applied",
+                applied.len(),
+                migrate::MIGRATIONS.len()
+            );
+        }
+        "migrate" => {
+            let n = migrate::run(&database).await.map_err(err)?;
+            eprintln!("applied {n} migration(s); schema is up to date");
+        }
+        "verify" => {
+            let report = backup::verify(&database).await.map_err(err)?;
+            for (table, n) in &report.counts {
+                eprintln!("  {table:<16} {n}");
+            }
+            for note in &report.notes {
+                eprintln!("  note: {note}");
+            }
+            if report.ok() {
+                eprintln!("OK: no integrity problems found");
+            } else {
+                for p in &report.problems {
+                    eprintln!("  PROBLEM: {p}");
+                }
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+        "backup" => {
+            let path = arg.ok_or("backup needs a file path (or `-` for stdout)")?;
+            let text = backup::export(&database).await.map_err(err)?;
+            if path == "-" {
+                use std::io::Write;
+                std::io::stdout()
+                    .write_all(text.as_bytes())
+                    .map_err(|e| e.to_string())?;
+            } else {
+                std::fs::write(path, &text).map_err(|e| format!("cannot write {path}: {e}"))?;
+                eprintln!("backup written to {path} ({} bytes)", text.len());
+            }
+        }
+        "restore" => {
+            let path = arg.ok_or("restore needs a backup file path")?;
+            let text =
+                std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+            let counts = backup::import(&database, &text).await.map_err(err)?;
+            eprintln!("restore complete:");
+            for (table, n) in &counts {
+                eprintln!("  {table:<16} {n}");
+            }
+        }
+        _ => return Ok(usage()),
+    }
+    Ok(ExitCode::SUCCESS)
 }

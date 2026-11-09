@@ -1,0 +1,36 @@
+# Isolated stack for the Playwright end-to-end tests (`npm run test:e2e`).
+#
+# - Separate compose project (`hourwise-e2e`) and ports (3100/8180), so it never touches the
+#   development stack or its volumes.
+# - The database and uploads live on tmpfs: every run starts empty and nothing is left behind.
+# - Credentials below are throwaway test values, not secrets.
+name: hourwise-e2e
+
+services:
+  backend:
+    build: ./backend
+    environment:
+      TURSO_DATABASE_URL: file:/data/db/hourwise-e2e.db
+      JWT_SECRET: e2e-only-secret-e2e-only-secret-e2e-only
+      JWT_TTL_HOURS: "2"
+      COOKIE_SECURE: "true"
+      LOGIN_MAX_ATTEMPTS: "50"
+      ADMIN_EMAIL: e2e-admin@example.com
+      ADMIN_PASSWORD: E2eAdminPass1
+      ADMIN_NAME: E2E Admin
+      UPLOAD_DIR: /data/uploads
+    tmpfs:
+      - /data/db:uid=10001
+      - /data/uploads:uid=10001
+    ports:
+      - "8180:8080"
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        BACKEND_URL: http://backend:8080
+    depends_on:
+      - backend
+    ports:
+      - "3100:3000"

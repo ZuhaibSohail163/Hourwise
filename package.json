@@ -11,6 +11,17 @@
     "format:backend": "node scripts/cargo.mjs fmt",
     "format:frontend": "npm --prefix frontend run format",
     "format:check": "node scripts/cargo.mjs fmt --check && npm --prefix frontend run format:check",
-    "check": "npm run format:check && npm run lint && npm --prefix frontend run typecheck"
+    "check": "npm run format:check && npm run lint && npm --prefix frontend run typecheck",
+    "test": "npm run test:backend && npm run test:frontend",
+    "test:backend": "node scripts/cargo.mjs test",
+    "test:unit": "node scripts/cargo.mjs test --lib",
+    "test:integration": "node scripts/cargo.mjs test --tests --test api --test db --test security",
+    "test:turso": "node scripts/cargo.mjs test --test turso_cloud -- --ignored --nocapture",
+    "test:frontend": "npm --prefix frontend test",
+    "test:e2e": "node scripts/e2e.mjs",
+    "test:all": "npm test && npm run test:e2e",
+    "backup": "node scripts/backup.mjs",
+    "dev:backend": "node scripts/cargo.mjs run",
+    "dev:frontend": "npm --prefix frontend run dev"
   }
 }

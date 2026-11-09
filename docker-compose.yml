@@ -1,31 +1,21 @@
 name: hourwise
 
-services:
-  db:
-    image: postgres:16-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-hourwise}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hourwise}
-      POSTGRES_DB: ${POSTGRES_DB:-hourwise}
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    ports:
-      - "${POSTGRES_PORT:-5432}:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hourwise} -d ${POSTGRES_DB:-hourwise}"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
+# Database: the backend talks to Turso Cloud when TURSO_DATABASE_URL / TURSO_AUTH_TOKEN are set
+# in .env. Without them it uses a local libSQL/SQLite file in the `dbdata` volume, so the stack
+# runs fully offline for development. See README -> Database.
 
+services:
   backend:
     build: ./backend
     restart: unless-stopped
     environment:
-      # Set DATABASE_URL in .env to use a hosted Postgres (Neon, Supabase, RDS...) instead.
-      DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-hourwise}:${POSTGRES_PASSWORD:-hourwise}@db:5432/${POSTGRES_DB:-hourwise}}
+      TURSO_DATABASE_URL: ${TURSO_DATABASE_URL:-file:/data/db/hourwise.db}
+      TURSO_AUTH_TOKEN: ${TURSO_AUTH_TOKEN:-}
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env (at least 32 characters)}
       JWT_TTL_HOURS: ${JWT_TTL_HOURS:-168}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      LOGIN_MAX_ATTEMPTS: ${LOGIN_MAX_ATTEMPTS:-5}
+      LOGIN_LOCKOUT_SECS: ${LOGIN_LOCKOUT_SECS:-900}
       ADMIN_EMAIL: ${ADMIN_EMAIL:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       ADMIN_NAME: ${ADMIN_NAME:-Administrator}
@@ -33,9 +23,7 @@ services:
       BIND_ADDR: 0.0.0.0:8080
     volumes:
       - uploads:/data/uploads
-    depends_on:
-      db:
-        condition: service_healthy
+      - dbdata:/data/db
     ports:
       - "${BACKEND_PORT:-8080}:8080"
 
@@ -51,5 +39,5 @@ services:
       - "${FRONTEND_PORT:-3000}:3000"
 
 volumes:
-  pgdata:
   uploads:
+  dbdata:

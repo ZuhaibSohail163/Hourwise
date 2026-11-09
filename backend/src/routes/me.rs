@@ -2,17 +2,19 @@ use std::path::Path;
 
 use axum::{
     extract::{Multipart, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::{
+    args,
     auth::{hash_password, validate_password, verify_password, AuthUser},
+    db,
     error::{AppError, AppResult},
     models::User,
-    routes::clean,
+    routes::{auth::session_headers, clean},
     AppState,
 };
 
@@ -48,13 +50,12 @@ pub async fn update_me(
         Some(t) => clean(Some(t)),
         None => user.job_title.clone(),
     };
-    let updated = sqlx::query_as::<_, User>(
-        "UPDATE users SET name = $2, job_title = $3, updated_at = now() WHERE id = $1 RETURNING *",
+    let conn = state.db.conn().await?;
+    let updated: User = db::query_one(
+        &conn,
+        "UPDATE users SET name = ?2, job_title = ?3, updated_at = ?4 WHERE id = ?1 RETURNING *",
+        args![user.id, name, job_title, db::now_ts()],
     )
-    .bind(user.id)
-    .bind(name)
-    .bind(job_title)
-    .fetch_one(&state.db)
     .await?;
     Ok(Json(updated))
 }
@@ -69,18 +70,22 @@ pub async fn change_password(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     Json(body): Json<ChangePassword>,
-) -> AppResult<StatusCode> {
+) -> AppResult<(StatusCode, HeaderMap)> {
     if !verify_password(body.current_password, user.password_hash.clone()).await {
         return Err(AppError::bad("Current password is incorrect"));
     }
     validate_password(&body.new_password)?;
     let hash = hash_password(body.new_password).await?;
-    sqlx::query("UPDATE users SET password_hash = $2, updated_at = now() WHERE id = $1")
-        .bind(user.id)
-        .bind(hash)
-        .execute(&state.db)
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
+    let conn = state.db.conn().await?;
+    // Bumping the epoch signs out every other browser/device; this one gets a fresh session.
+    let updated: User = db::query_one(
+        &conn,
+        "UPDATE users SET password_hash = ?2, session_epoch = session_epoch + 1, updated_at = ?3
+         WHERE id = ?1 RETURNING *",
+        args![user.id, hash, db::now_ts()],
+    )
+    .await?;
+    Ok((StatusCode::NO_CONTENT, session_headers(&updated, &state)?))
 }
 
 fn extension_for(content_type: &str) -> Option<&'static str> {
@@ -156,12 +161,16 @@ pub async fn upload_avatar(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    let updated = sqlx::query_as::<_, User>(
-        "UPDATE users SET avatar_url = $2, updated_at = now() WHERE id = $1 RETURNING *",
+    let conn = state.db.conn().await?;
+    let updated: User = db::query_one(
+        &conn,
+        "UPDATE users SET avatar_url = ?2, updated_at = ?3 WHERE id = ?1 RETURNING *",
+        args![
+            user.id,
+            format!("/uploads/avatars/{filename}"),
+            db::now_ts()
+        ],
     )
-    .bind(user.id)
-    .bind(format!("/uploads/avatars/{filename}"))
-    .fetch_one(&state.db)
     .await?;
 
     remove_avatar_file(&state.config.upload_dir, &user.avatar_url).await;
@@ -172,11 +181,12 @@ pub async fn delete_avatar(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
 ) -> AppResult<Json<User>> {
-    let updated = sqlx::query_as::<_, User>(
-        "UPDATE users SET avatar_url = NULL, updated_at = now() WHERE id = $1 RETURNING *",
+    let conn = state.db.conn().await?;
+    let updated: User = db::query_one(
+        &conn,
+        "UPDATE users SET avatar_url = NULL, updated_at = ?2 WHERE id = ?1 RETURNING *",
+        args![user.id, db::now_ts()],
     )
-    .bind(user.id)
-    .fetch_one(&state.db)
     .await?;
     remove_avatar_file(&state.config.upload_dir, &user.avatar_url).await;
     Ok(Json(updated))
