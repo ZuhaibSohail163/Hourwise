@@ -1,0 +1,16 @@
+{
+  "name": "hourwise",
+  "private": true,
+  "description": "Repo-level lint/format commands for the Rust backend and Next.js frontend. No dependencies.",
+  "scripts": {
+    "lint": "npm run lint:backend && npm run lint:frontend",
+    "lint:backend": "node scripts/cargo.mjs clippy --all-targets -- -D warnings",
+    "lint:frontend": "npm --prefix frontend run lint",
+    "lint:fix": "node scripts/cargo.mjs clippy --fix --allow-dirty --allow-staged --all-targets && npm --prefix frontend run lint:fix",
+    "format": "npm run format:backend && npm run format:frontend",
+    "format:backend": "node scripts/cargo.mjs fmt",
+    "format:frontend": "npm --prefix frontend run format",
+    "format:check": "node scripts/cargo.mjs fmt --check && npm --prefix frontend run format:check",
+    "check": "npm run format:check && npm run lint && npm --prefix frontend run typecheck"
+  }
+}

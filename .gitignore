@@ -1,0 +1,32 @@
+# ---- Environment / secrets ----
+.env
+.env.*
+!.env.example
+
+# ---- Rust backend ----
+backend/target/
+backend/uploads/
+**/*.rs.bk
+
+# ---- Next.js frontend ----
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/next-env.d.ts
+frontend/*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ---- Editors / OS ----
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ---- Misc ----
+coverage/
+*.log
