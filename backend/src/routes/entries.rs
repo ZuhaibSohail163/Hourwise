@@ -1,3 +1,4 @@
+use crate::db::Connection;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -5,19 +6,20 @@ use axum::{
 };
 use chrono::{Duration, NaiveDate, Utc};
 use serde::Deserialize;
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::{
+    args,
     auth::AuthUser,
+    db,
     error::{AppError, AppResult},
     models::{TimeEntryView, ENTRY_SELECT},
     routes::date_range,
     AppState,
 };
 
-const MAX_DESCRIPTION: usize = 5000;
-const MINUTES_PER_DAY: i64 = 24 * 60;
+pub const MAX_DESCRIPTION: usize = 5000;
+pub const MINUTES_PER_DAY: i64 = 24 * 60;
 
 #[derive(Deserialize)]
 pub struct EntryQuery {
@@ -35,16 +37,11 @@ pub async fn list(
     let sql = format!(
         "{ENTRY_SELECT}
          WHERE te.user_id = $1 AND te.entry_date BETWEEN $2 AND $3
-           AND ($4::uuid IS NULL OR te.project_id = $4)
+           AND ($4 IS NULL OR te.project_id = $4)
          ORDER BY te.entry_date DESC, te.created_at DESC"
     );
-    let entries = sqlx::query_as::<_, TimeEntryView>(&sql)
-        .bind(user.id)
-        .bind(from)
-        .bind(to)
-        .bind(q.project_id)
-        .fetch_all(&state.db)
-        .await?;
+    let mut conn = state.db.conn().await?;
+    let entries = db::query_all(&mut conn, &sql, args![user.id, from, to, q.project_id]).await?;
     Ok(Json(entries))
 }
 
@@ -57,17 +54,12 @@ pub struct EntryInput {
     pub description: String,
 }
 
-/// Shared validation for create and update.
-async fn validate(
-    db: &PgPool,
-    user_id: Uuid,
-    input: &EntryInput,
-    existing_id: Option<Uuid>,
-) -> AppResult<()> {
+/// Input checks that don't need the database.
+pub fn validate_input(input: &EntryInput, today: NaiveDate) -> AppResult<()> {
     if input.minutes <= 0 {
         return Err(AppError::bad("Time must be greater than zero"));
     }
-    if input.minutes as i64 > MINUTES_PER_DAY {
+    if i64::from(input.minutes) > MINUTES_PER_DAY {
         return Err(AppError::bad("A single entry cannot exceed 24 hours"));
     }
     if input.description.chars().count() > MAX_DESCRIPTION {
@@ -75,47 +67,63 @@ async fn validate(
             "Description is too long (max 5000 characters)",
         ));
     }
-    if input.entry_date > Utc::now().date_naive() + Duration::days(1) {
+    // One day of slack so users ahead of UTC can log "today" in their own time zone.
+    if input.entry_date > today + Duration::days(1) {
         return Err(AppError::bad("You cannot log time in the future"));
     }
+    Ok(())
+}
+
+/// `true` when adding `minutes` to a day that already has `existing` minutes stays within 24h.
+pub fn fits_in_day(existing: i64, minutes: i32) -> bool {
+    existing + i64::from(minutes) <= MINUTES_PER_DAY
+}
+
+/// Shared validation for create and update. Runs inside the write transaction so the
+/// daily-total check and the write are atomic.
+async fn validate(
+    conn: &mut Connection,
+    user_id: Uuid,
+    input: &EntryInput,
+    existing_id: Option<Uuid>,
+) -> AppResult<()> {
+    validate_input(input, Utc::now().date_naive())?;
+
+    // Serialise this user's concurrent writes until the transaction ends, so two requests can't
+    // both read the old daily total and together exceed 24h. Other users are not blocked.
+    db::lock_user(conn, user_id).await?;
 
     // Users may only log time to non-archived projects they are a member of.
-    let archived: Option<bool> = sqlx::query_scalar(
+    let archived = db::query_scalar::<bool>(
+        conn,
         "SELECT p.is_archived FROM projects p
          JOIN project_members pm ON pm.project_id = p.id
          WHERE p.id = $1 AND pm.user_id = $2",
+        args![input.project_id, user_id],
     )
-    .bind(input.project_id)
-    .bind(user_id)
-    .fetch_optional(db)
     .await?;
     match archived {
         None => return Err(AppError::bad("You are not a member of that project")),
-        Some(true) => return Err(AppError::bad("That project is archived")),
         Some(false) => {}
+        Some(true) => return Err(AppError::bad("That project is archived")),
     }
 
-    let day_total: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(minutes), 0)::BIGINT FROM time_entries
-         WHERE user_id = $1 AND entry_date = $2 AND ($3::uuid IS NULL OR id <> $3)",
+    let day_total = db::query_i64(
+        conn,
+        "SELECT COALESCE(SUM(minutes), 0) FROM time_entries
+         WHERE user_id = $1 AND entry_date = $2 AND ($3 IS NULL OR id <> $3)",
+        args![user_id, input.entry_date, existing_id],
     )
-    .bind(user_id)
-    .bind(input.entry_date)
-    .bind(existing_id)
-    .fetch_one(db)
     .await?;
-    if day_total + input.minutes as i64 > MINUTES_PER_DAY {
+    if !fits_in_day(day_total, input.minutes) {
         return Err(AppError::bad("Total time for a day cannot exceed 24 hours"));
     }
     Ok(())
 }
 
-async fn fetch_view(db: &PgPool, id: Uuid) -> AppResult<TimeEntryView> {
+async fn fetch_view(conn: &mut Connection, id: Uuid) -> AppResult<TimeEntryView> {
     let sql = format!("{ENTRY_SELECT} WHERE te.id = $1");
-    Ok(sqlx::query_as::<_, TimeEntryView>(&sql)
-        .bind(id)
-        .fetch_one(db)
-        .await?)
+    db::query_one(conn, &sql, args![id]).await
 }
 
 pub async fn create(
@@ -123,21 +131,31 @@ pub async fn create(
     AuthUser(user): AuthUser,
     Json(input): Json<EntryInput>,
 ) -> AppResult<(StatusCode, Json<TimeEntryView>)> {
-    validate(&state.db, user.id, &input, None).await?;
+    validate_input(&input, Utc::now().date_naive())?;
+    let mut conn = state.db.conn().await?;
     let id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO time_entries (id, user_id, project_id, entry_date, minutes, description)
-         VALUES ($1, $2, $3, $4, $5, $6)",
+    let now = db::now_ts();
+
+    let mut tx = db::write_tx(&mut conn).await?;
+    validate(&mut tx, user.id, &input, None).await?;
+    db::execute(
+        &mut tx,
+        "INSERT INTO time_entries
+            (id, user_id, project_id, entry_date, minutes, description, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $7)",
+        args![
+            id,
+            user.id,
+            input.project_id,
+            input.entry_date,
+            input.minutes,
+            input.description.trim(),
+            now
+        ],
     )
-    .bind(id)
-    .bind(user.id)
-    .bind(input.project_id)
-    .bind(input.entry_date)
-    .bind(input.minutes)
-    .bind(input.description.trim())
-    .execute(&state.db)
     .await?;
-    Ok((StatusCode::CREATED, Json(fetch_view(&state.db, id).await?)))
+    tx.commit().await?;
+    Ok((StatusCode::CREATED, Json(fetch_view(&mut conn, id).await?)))
 }
 
 pub async fn update(
@@ -146,27 +164,36 @@ pub async fn update(
     Path(id): Path<Uuid>,
     Json(input): Json<EntryInput>,
 ) -> AppResult<Json<TimeEntryView>> {
-    let owner: Option<Uuid> = sqlx::query_scalar("SELECT user_id FROM time_entries WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&state.db)
-        .await?;
+    let mut conn = state.db.conn().await?;
+    let mut tx = db::write_tx(&mut conn).await?;
+    let owner = db::query_scalar::<Uuid>(
+        &mut tx,
+        "SELECT user_id FROM time_entries WHERE id = $1",
+        args![id],
+    )
+    .await?;
+    // Another user's entry is reported as "not found" so ids can't be probed.
     if owner != Some(user.id) {
         return Err(AppError::not_found("Time entry"));
     }
-    validate(&state.db, user.id, &input, Some(id)).await?;
-    sqlx::query(
+    validate(&mut tx, user.id, &input, Some(id)).await?;
+    db::execute(
+        &mut tx,
         "UPDATE time_entries
-         SET project_id = $2, entry_date = $3, minutes = $4, description = $5, updated_at = now()
+         SET project_id = $2, entry_date = $3, minutes = $4, description = $5, updated_at = $6
          WHERE id = $1",
+        args![
+            id,
+            input.project_id,
+            input.entry_date,
+            input.minutes,
+            input.description.trim(),
+            db::now_ts()
+        ],
     )
-    .bind(id)
-    .bind(input.project_id)
-    .bind(input.entry_date)
-    .bind(input.minutes)
-    .bind(input.description.trim())
-    .execute(&state.db)
     .await?;
-    Ok(Json(fetch_view(&state.db, id).await?))
+    tx.commit().await?;
+    Ok(Json(fetch_view(&mut conn, id).await?))
 }
 
 pub async fn remove(
@@ -174,13 +201,68 @@ pub async fn remove(
     AuthUser(user): AuthUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<StatusCode> {
-    let result = sqlx::query("DELETE FROM time_entries WHERE id = $1 AND user_id = $2")
-        .bind(id)
-        .bind(user.id)
-        .execute(&state.db)
-        .await?;
-    if result.rows_affected() == 0 {
+    let mut conn = state.db.conn().await?;
+    let affected = db::execute(
+        &mut conn,
+        "DELETE FROM time_entries WHERE id = $1 AND user_id = $2",
+        args![id, user.id],
+    )
+    .await?;
+    if affected == 0 {
         return Err(AppError::not_found("Time entry"));
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input(minutes: i32, date: NaiveDate, desc: &str) -> EntryInput {
+        EntryInput {
+            project_id: Uuid::nil(),
+            entry_date: date,
+            minutes,
+            description: desc.into(),
+        }
+    }
+
+    fn day(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap_or_default()
+    }
+
+    #[test]
+    fn minutes_must_be_positive_and_at_most_a_day() {
+        let today = day("2026-11-09");
+        assert!(validate_input(&input(0, today, ""), today).is_err());
+        assert!(validate_input(&input(-5, today, ""), today).is_err());
+        assert!(validate_input(&input(1, today, ""), today).is_ok());
+        assert!(validate_input(&input(1440, today, ""), today).is_ok());
+        assert!(validate_input(&input(1441, today, ""), today).is_err());
+    }
+
+    #[test]
+    fn future_dates_allow_one_day_of_slack() {
+        let today = day("2026-12-31");
+        assert!(validate_input(&input(60, day("2027-01-01"), ""), today).is_ok());
+        assert!(validate_input(&input(60, day("2027-01-02"), ""), today).is_err());
+        assert!(validate_input(&input(60, day("2020-02-29"), ""), today).is_ok());
+    }
+
+    #[test]
+    fn description_limit_counts_characters_not_bytes() {
+        let today = day("2026-11-09");
+        let ok = "\u{e9}".repeat(MAX_DESCRIPTION);
+        assert!(validate_input(&input(60, today, &ok), today).is_ok());
+        let too_long = "a".repeat(MAX_DESCRIPTION + 1);
+        assert!(validate_input(&input(60, today, &too_long), today).is_err());
+    }
+
+    #[test]
+    fn daily_cap_is_inclusive_24_hours() {
+        assert!(fits_in_day(0, 1440));
+        assert!(fits_in_day(1380, 60));
+        assert!(!fits_in_day(1380, 61));
+        assert!(!fits_in_day(1440, 1));
+    }
 }

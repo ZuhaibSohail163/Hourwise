@@ -1,31 +1,57 @@
 name: hourwise
 
+# Local development stack: PostgreSQL + Rust API + Next.js frontend.
+#
+#   docker compose up -d --build     # everything, at http://localhost:3000
+#   docker compose up -d db          # only PostgreSQL (for `npm run dev:backend`)
+#   docker compose logs -f backend   # logs
+#   docker compose down              # stop (data is kept in the `postgres_data` volume)
+#
+# Settings come from the root `.env` (copy `.env.example`). Nothing here is a production
+# credential; production runs on Dokploy (see README -> "Deploying with Dokploy").
+#
+# The volume is deliberately named `postgres_data`, not `pgdata`: an older `hourwise_pgdata`
+# volume from a previous version may still exist and must not be mounted by accident.
+
 services:
   db:
-    image: postgres:16-alpine
+    image: postgres:17-alpine
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-hourwise}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hourwise}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-hourwise}
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
+    # Published on the loopback interface only, for `npm run dev:backend` and database tools.
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hourwise} -d ${POSTGRES_DB:-hourwise}"]
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 20
+      start_period: 10s
 
   backend:
     build: ./backend
     restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
     environment:
-      # Set DATABASE_URL in .env to use a hosted Postgres (Neon, Supabase, RDS...) instead.
-      DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-hourwise}:${POSTGRES_PASSWORD:-hourwise}@db:5432/${POSTGRES_DB:-hourwise}}
+      # Use a URL-safe POSTGRES_PASSWORD (letters and digits), or percent-encode it here.
+      DATABASE_URL: postgres://${POSTGRES_USER:-hourwise}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-hourwise}
+      DATABASE_MAX_CONNECTIONS: ${DATABASE_MAX_CONNECTIONS:-10}
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env (at least 32 characters)}
       JWT_TTL_HOURS: ${JWT_TTL_HOURS:-168}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      LOGIN_MAX_ATTEMPTS: ${LOGIN_MAX_ATTEMPTS:-5}
+      LOGIN_MAX_ATTEMPTS_PER_IP: ${LOGIN_MAX_ATTEMPTS_PER_IP:-20}
+      LOGIN_LOCKOUT_SECS: ${LOGIN_LOCKOUT_SECS:-900}
+      PASSWORD_HASH_CONCURRENCY: ${PASSWORD_HASH_CONCURRENCY:-4}
+      # Empty by default: the frontend port is published, so clients could fake the header.
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
       ADMIN_EMAIL: ${ADMIN_EMAIL:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       ADMIN_NAME: ${ADMIN_NAME:-Administrator}
@@ -33,11 +59,8 @@ services:
       BIND_ADDR: 0.0.0.0:8080
     volumes:
       - uploads:/data/uploads
-    depends_on:
-      db:
-        condition: service_healthy
     ports:
-      - "${BACKEND_PORT:-8080}:8080"
+      - "127.0.0.1:${BACKEND_PORT:-8080}:8080"
 
   frontend:
     build:
@@ -46,10 +69,11 @@ services:
         BACKEND_URL: http://backend:8080
     restart: unless-stopped
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     ports:
       - "${FRONTEND_PORT:-3000}:3000"
 
 volumes:
-  pgdata:
+  postgres_data:
   uploads:

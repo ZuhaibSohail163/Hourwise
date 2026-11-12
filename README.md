@@ -5,17 +5,22 @@ Team members sign in with email and password and log hours and minutes per day a
 projects they belong to. Admins get their own interface where they create projects, manage
 members, and see who worked on what, for how long and what they did.
 
-- **Backend:** Rust ([axum](https://github.com/tokio-rs/axum) + [sqlx](https://github.com/launchbadge/sqlx)) REST API
+- **Backend:** Rust ([axum](https://github.com/tokio-rs/axum)) REST API with
+  [SQLx](https://github.com/launchbadge/sqlx) and a PostgreSQL connection pool
 - **Frontend:** Next.js 16 (App Router, React 19, TypeScript, Tailwind CSS 4)
-- **Database:** PostgreSQL 16. It is bundled as a Docker container, and any hosted Postgres (Neon, Supabase, RDS…) also works.
-- **Packaging:** Docker Compose. One command starts the whole stack.
+- **Database:** PostgreSQL 14+ (17 in Docker)
+- **Packaging:** Docker images for both apps. Docker Compose for local development. Production
+  deployment with [Dokploy](https://dokploy.com): see **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**.
+
+There are no user-count limits anywhere in the code.
 
 ---
 
 ## Features
 
 ### For everyone
-- **Email + password sign-in.** Sessions use signed JWTs; passwords are hashed with Argon2.
+- **Email + password sign-in.** Passwords are hashed with Argon2. Sessions are HttpOnly cookies
+  with CSRF protection, and failed logins are rate limited.
 - **Timesheet (Day view).** Harvest-style week strip with daily totals. Click *Track time* to log
   hours + minutes, choose a project and write notes about the work. Entries can be edited and deleted.
 - **Timesheet (Week view).** A grid of projects × days with row, column and week totals.
@@ -47,31 +52,47 @@ members, and see who worked on what, for how long and what they did.
 
 ---
 
-## Quick start (Docker, recommended)
 
-**Prerequisites:** [Docker Desktop](https://www.docker.com/products/docker-desktop/) (or Docker Engine + Compose v2) and Git.
+---
 
-```bash
-# 1. Clone
-git clone <your-repo-url> hourwise
-cd hourwise
+## Architecture
 
-# 2. Create your environment file
-cp .env.example .env          # Windows PowerShell: Copy-Item .env.example .env
+```
+Browser ──HTTPS──▶ Next.js frontend (:3000) ──/api, /uploads──▶ Rust API (:8080) ──▶ PostgreSQL (:5432)
+                   the only public service       private network            private network
 ```
 
-3. Edit `.env` and set at least:
-   - `JWT_SECRET`: a random string of **32+ characters**. Generate one with `openssl rand -hex 32`
-     (or in PowerShell: `-join ((48..57)+(97..102) | Get-Random -Count 64 | % {[char]$_})`).
-   - `ADMIN_EMAIL` / `ADMIN_PASSWORD`: the first admin account.
-   - `POSTGRES_PASSWORD`: the database password.
+- **One origin for the browser.** The Next.js server proxies `/api/*` and `/uploads/*` to the
+  backend (`BACKEND_URL`, fixed at **build** time). So there is no CORS configuration, and the
+  session cookies are first-party and `SameSite=Strict`.
+- **Backend** (`backend/`): axum handlers in `src/routes/`, authentication in `src/auth.rs`, and
+  database access in `src/db.rs` (an SQLx `PgPool` with typed helpers). Migrations are embedded
+  in the binary and applied on startup. The same binary is a small CLI:
+  `serve | migrate | check-db | verify | healthcheck`.
+- **Frontend** (`frontend/`): client components calling the API through `src/lib/api.ts`. It
+  sends cookies and the CSRF header automatically.
+- **Health checks:**
+  - `GET /api/health`: liveness; the process is up.
+  - `GET /api/health/ready`: readiness; the database answers.
+  - `GET /healthz`: the frontend is up.
+  - Both images have a Docker `HEALTHCHECK`. No curl is needed: the backend binary probes itself.
+
+---
+
+## Quick start (Docker)
+
+Requirements: Docker Desktop (or Docker Engine with the compose plugin) and Node.js 20+ for the
+helper scripts.
 
 ```bash
-# 4. Build and start everything (the first build takes a few minutes while Rust compiles)
-docker compose up -d --build
+cp .env.example .env          # Windows: copy .env.example .env
+# Edit .env: set POSTGRES_PASSWORD (openssl rand -hex 24), JWT_SECRET (openssl rand -hex 32),
+# and ADMIN_EMAIL / ADMIN_PASSWORD for the first admin account.
+docker compose up -d --build  # PostgreSQL + API + frontend
 ```
 
-5. Open **http://localhost:3000** and sign in with `ADMIN_EMAIL` / `ADMIN_PASSWORD`.
+Open **http://localhost:3000** and sign in with `ADMIN_EMAIL` / `ADMIN_PASSWORD`. On first start
+the backend applies the migrations and creates that admin.
 
 ### First steps as an admin
 1. Go to **Profile** and change the admin password.
@@ -84,48 +105,211 @@ docker compose up -d --build
 > The initial admin is created **only if the database has no admin yet**, so changing
 > `ADMIN_PASSWORD` later has no effect. Use the Profile page instead.
 
+
 ### Everyday commands
 
 | Task | Command |
 | --- | --- |
-| Start / rebuild | `docker compose up -d --build` |
-| Stop | `docker compose down` |
-| View logs | `docker compose logs -f backend` (or `frontend`, `db`) |
-| Open a DB shell | `docker compose exec db psql -U hourwise hourwise` |
-| Back up the DB | `docker compose exec db pg_dump -U hourwise hourwise > backup.sql` |
-| Restore a backup | `docker compose exec -T db psql -U hourwise hourwise < backup.sql` |
-| **Wipe all data** | `docker compose down -v` (deletes the database and avatar volumes) |
+| Start / rebuild everything | `docker compose up -d --build` |
+| Stop (keeps data) | `docker compose down` |
+| Logs | `docker compose logs -f backend` (or `frontend`, `db`) |
+| Start only PostgreSQL | `npm run db:up` |
+| SQL shell | `docker compose exec db psql -U hourwise -d hourwise` |
+| Apply migrations (normally automatic) | `npm run db:migrate` |
+| Integrity report (read-only) | `npm run db:verify` |
+| **Verified backup** | `npm run backup` → `backups/hourwise-<timestamp>.dump` |
+| **Reset the local dev database** | `npm run db:reset -- --yes` (deletes only the `hourwise_postgres_data` volume) |
 
-Data lives in two named Docker volumes: `pgdata` (database) and `uploads` (profile pictures).
+Local data lives in Docker volumes: `hourwise_postgres_data` (PostgreSQL) and `hourwise_uploads`
+(avatars). `docker compose down -v` would delete **both**. Prefer `npm run db:reset`, which only
+deletes the database and asks for `--yes`. Volumes left over from earlier versions
+(`hourwise_pgdata`, `hourwise_dbdata`) are not used or touched by this version.
 
 ---
 
-## Local development (without Docker for the app)
+## Local development (hot reload)
 
-You can still run Postgres in Docker and run the backend and frontend natively for faster iteration.
-
-**Prerequisites:** [Rust](https://rustup.rs/) (stable), Node.js 20+ and Docker (for Postgres only).
+Run PostgreSQL in Docker and the apps on your machine:
 
 ```bash
-# 1. Start only the database (uses POSTGRES_* from the root .env, or the defaults)
-docker compose up -d db
-
-# 2. Backend
-cd backend
-cp .env.example .env            # make DATABASE_URL match your db credentials; set JWT_SECRET
-cargo run                       # http://localhost:8080 (migrations run automatically)
-
-# 3. Frontend (new terminal)
-cd frontend
-npm install
-npm run dev                     # http://localhost:3000, proxies /api to http://localhost:8080
+npm run db:up                             # PostgreSQL on 127.0.0.1:5432
+cp backend/.env.example backend/.env      # set DATABASE_URL (same password as POSTGRES_PASSWORD) and JWT_SECRET
+npm run dev:backend                       # API on http://localhost:8080; applies migrations on start
+npm --prefix frontend install
+npm run dev:frontend                      # http://localhost:3000, proxies /api to :8080
 ```
 
-If the backend runs somewhere other than `http://localhost:8080`, start the frontend with
-`BACKEND_URL=http://host:port npm run dev`.
+- `npm run dev:backend` uses your local Rust toolchain if there is one, otherwise it runs
+  `cargo run` in the `rust:1-bookworm` Docker image. Rust needs a C toolchain: MSVC Build Tools on
+  Windows, Xcode CLT on macOS, build-essential on Linux. On Windows, install it with
+  `winget install Rustlang.Rustup`.
+- Stop the full stack first (`docker compose stop backend frontend`) because it uses the same
+  ports, or change `BACKEND_PORT` / `FRONTEND_PORT`.
+- If the backend runs elsewhere, start the frontend with `BACKEND_URL=http://host:port`.
 
-> If you also run the full stack with `docker compose up`, the containers use ports 8080 and 3000
-> as well. Stop them first, or change `BACKEND_PORT` / `FRONTEND_PORT` in `.env`.
+---
+
+## Configuration
+
+### Root `.env` (Docker Compose)
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `POSTGRES_USER` / `POSTGRES_DB` | `hourwise` | Local database user and name. |
+| `POSTGRES_PASSWORD` | *(required)* | Local database password. Use letters and digits (it is put into a URL). |
+| `POSTGRES_PORT` | `5432` | Host port, bound to `127.0.0.1` only. |
+| `DATABASE_MAX_CONNECTIONS` | `10` | Pool size per backend instance. |
+| `JWT_SECRET` | *(required)* | Signs session cookies. At least 32 characters. Changing it signs everyone out. |
+| `JWT_TTL_HOURS` | `168` | Session lifetime. |
+| `COOKIE_SECURE` | `true` | `Secure` cookies. Browsers accept them on `http://localhost`; set `false` only to test over plain HTTP on another host. |
+| `LOGIN_MAX_ATTEMPTS` / `LOGIN_LOCKOUT_SECS` | `5` / `900` | Failed logins per email **from one client address** before that pair is locked for `LOGIN_LOCKOUT_SECS`. |
+| `LOGIN_MAX_ATTEMPTS_PER_IP` | `20` | Failed logins per client address across all emails (password spraying). |
+| `PASSWORD_HASH_CONCURRENCY` | `4` | Argon2 operations at the same time (~19 MB each). Requests that wait more than 5 s get `503`. |
+| `TRUSTED_PROXIES` | *(empty)* | Comma-separated IPs/CIDR ranges whose `X-Forwarded-For` is trusted. Keep empty locally; for Dokploy see `docs/DEPLOYMENT.md`. |
+| `ADMIN_EMAIL` / `ADMIN_PASSWORD` / `ADMIN_NAME` | – | First admin, created on startup only when no admin exists. |
+| `BACKEND_PORT` / `FRONTEND_PORT` | `8080` / `3000` | Host ports. The backend is bound to `127.0.0.1`. |
+
+### Backend environment (`backend/.env` for `npm run dev:backend`, or the container environment)
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `DATABASE_URL` | *(required)* | `postgres://user:password@host:5432/dbname`. Add `?sslmode=require` for a database reached over the internet. |
+| `DATABASE_MAX_CONNECTIONS` | `10` | Maximum pooled connections. Keep (replicas × this) below PostgreSQL's `max_connections` (100 by default). |
+| `DATABASE_ACQUIRE_TIMEOUT_SECS` | `5` | How long a request waits for a free connection before failing with `503`. |
+| `DATABASE_STATEMENT_TIMEOUT_SECS` | `30` | Server-side limit per SQL statement. |
+| `BIND_ADDR` | `0.0.0.0:8080` | Listen address (`127.0.0.1:8080` in `backend/.env`). |
+| `UPLOAD_DIR` | `./uploads` (`/data/uploads` in Docker) | Avatar storage. Needs a persistent volume in production. |
+| `CORS_ORIGIN` | – | Only if a browser calls the API directly. Not needed with the Next.js proxy. |
+| `RUST_LOG` | `hourwise_backend=info,tower_http=info` | Log filter. |
+| `JWT_*`, `COOKIE_SECURE`, `LOGIN_*`, `ADMIN_*` | | As above. |
+
+### Frontend
+
+| Variable | When | Description |
+| --- | --- | --- |
+| `BACKEND_URL` | **build time** (`--build-arg`, or the env of `npm run build` / `npm run dev`) | Where the Next.js server proxies `/api` and `/uploads`. `http://backend:8080` in Compose, the backend's private service name in Dokploy. |
+
+Secrets are only ever read from the environment. The database password, `JWT_SECRET` and
+`ADMIN_PASSWORD` are never logged: the config's debug output redacts them, and only
+`user@host:port/db` is printed about the database.
+
+---
+
+## Database
+
+### Schema
+
+| Table | Columns |
+| --- | --- |
+| `users` | `id UUID` PK, `email` (unique, lower-case enforced by a `CHECK`), `name`, Argon2 `password_hash`, `role` (`admin`/`member`), `job_title`, `avatar_url`, `is_active BOOLEAN`, `session_epoch BIGINT`, `created_at`/`updated_at TIMESTAMPTZ` |
+| `projects` | `id UUID` PK, `name`, `client`, `description`, `color`, `is_archived BOOLEAN`, timestamps |
+| `project_members` | (`project_id`, `user_id`) composite PK, both foreign keys `ON DELETE CASCADE`, `added_at` |
+| `time_entries` | `id UUID` PK, `user_id`/`project_id` FKs `ON DELETE CASCADE`, `entry_date DATE`, `minutes INTEGER CHECK (1..1440)`, `description`, timestamps |
+
+Indexes: `time_entries (user_id, entry_date)` (timesheets and the daily cap),
+`(project_id, entry_date)` (project reports), `(entry_date)` (organisation-wide reports and
+dashboard stats), and `project_members (user_id)`.
+
+- **IDs** are UUIDs generated by the application.
+- **Dates** are `DATE`. Timestamps are `TIMESTAMPTZ`, stored in UTC with microsecond precision.
+- **Durations** are whole minutes, so all totals are exact.
+- **The 24-hour daily cap** is enforced in a transaction that first locks the user's row
+  (`SELECT … FOR UPDATE`). Simultaneous submissions for the same user are serialised, and other
+  users aren't blocked.
+- **Deleting** a project or user removes its memberships and entries in one transaction.
+  Removing a member keeps their entries.
+
+### Migrations
+
+- **Location:** `backend/migrations/NNNN_description.sql`, embedded at compile time with
+  `sqlx::migrate!` and applied automatically on startup (or with `hourwise-backend migrate` /
+  `npm run db:migrate`).
+- **Tracking:** applied versions and checksums are stored in `_sqlx_migrations`. Each migration
+  runs in its own transaction, and a PostgreSQL advisory lock makes simultaneous startups safe.
+- **Safety:** the backend refuses to start if an applied migration was edited, or if the database
+  has a migration this build doesn't know (e.g. an older backend against a newer database).
+- **Never edit an applied migration.** Add `0002_….sql` and so on.
+- **Before migrating production,** take a backup.
+
+### Starting fresh
+
+The previous Turso databases held no data that needs to be kept, so there is no data migration.
+A new PostgreSQL database is initialised automatically: start the backend with `DATABASE_URL`
+pointing at an empty database and it creates the schema and the first admin
+(`ADMIN_EMAIL` / `ADMIN_PASSWORD`). Your Turso databases were not modified. Delete them in the
+Turso dashboard whenever you like.
+
+---
+
+## Backups and recovery
+
+- **Local development:** `npm run backup`.
+  - It runs `pg_dump --format=custom` inside the `db` container and writes it to `backups/`
+    (gitignored) with a SHA-256 checksum.
+  - It then restores the dump into a **throwaway** PostgreSQL container and checks that every
+    table's row count matches. Only then does it report `OK`.
+  - `npm run backup -- --keep 30` also prunes old files.
+- **Production (Dokploy):** scheduled `pg_dump` backups to off-server S3-compatible storage,
+  volume backups for avatars, retention, monthly restore tests and the restore procedure are all
+  in [docs/DEPLOYMENT.md → Backups and restore](docs/DEPLOYMENT.md#7-backups-and-restore).
+- **Manual restore** of a local dump, into a database that must be empty:
+
+  ```bash
+  docker compose exec -T db pg_restore -U hourwise -d hourwise --no-owner --exit-on-error < backups/<file>.dump
+  ```
+
+- **Treat backups as sensitive:** they contain emails, password hashes and time logs.
+
+---
+
+## Testing
+
+| Command | What runs | Database |
+| --- | --- | --- |
+| `npm test` | All Rust tests + all Vitest tests | disposable test server (below) |
+| `npm run test:backend` | Rust: unit, database, API and security tests | disposable test server |
+| `npm run test:unit` | Rust unit tests only | none |
+| `npm run test:integration` | Rust database + API + security tests | disposable test server |
+| `npm run test:frontend` | Vitest + React Testing Library (API mocked) | none |
+| `npm run test:e2e` | Playwright (Chromium) against an isolated stack on ports 3100/8180 | throwaway tmpfs PostgreSQL |
+| `npm run test:all` | All of the above | |
+
+**Rust test database safety.** `npm run test:backend` starts a disposable PostgreSQL server
+(`docker-compose.test.yml`: tmpfs, `127.0.0.1:55432`, marked `hourwise.disposable=on`), runs the
+tests and removes the server again. Each test creates its own `hourwise_test_<random>` database
+and drops it when it finishes. The harness (`backend/tests/common/mod.rs`) refuses to run unless
+all of these hold:
+
+- The server comes **only** from `HOURWISE_TEST_DATABASE_URL`. It never falls back to
+  `DATABASE_URL`.
+- The server is not the same server as any protected database:
+  - `DATABASE_URL` from your shell, the root `.env` or `backend/.env`
+  - the Compose development database
+  - the comparison normalises `postgres://`/`postgresql://`, host case, `localhost`/`127.0.0.1`/
+    `::1`/`host.docker.internal`, default ports, encoding and credentials
+- The server reports `hourwise.disposable = on`, which production servers don't.
+- Each new database is empty before migrations run.
+- Only databases it created itself (with the test prefix) are dropped.
+- Passwords are never printed.
+
+To use another disposable server, set `HOURWISE_TEST_DATABASE_URL` to its maintenance database,
+and start that server with `-c hourwise.disposable=on`.
+
+Coverage includes:
+
+- connectivity and pooling
+- migrations: fresh, repeated, concurrent, tampered and unknown
+- the schema: tables, indexes, column types
+- constraints: unique, check, not null, foreign keys, cascades
+- transactions and rollback
+- per-user row locking
+- the concurrent 24h-cap race: 16 simultaneous requests and exactly one wins
+- pool exhaustion and statement timeouts returning `503`
+- authentication, cookies, CSRF, session revocation and rate limiting
+- admin authorisation for every endpoint, and members not seeing each other's data
+- SQL-injection and malicious-input handling
+- timesheet create, read, update and delete, and reports
+- health and readiness endpoints
 
 ## Linting & formatting
 
@@ -137,100 +321,107 @@ If the backend runs somewhere other than `http://localhost:8080`, start the fron
 | **ESLint** (Next.js core-web-vitals + TypeScript + React hooks rules) | TS/TSX lints | `frontend/eslint.config.mjs` |
 | **TypeScript** | type checking | `frontend/tsconfig.json` |
 
-Run these from the **repo root**. They work in PowerShell, cmd and bash, and you don't need
-`npm install` at the root:
-
 ```bash
 npm run format          # auto-format backend + frontend
 npm run lint            # clippy + eslint, fail on any warning
 npm run lint:fix        # apply automatic lint fixes
-npm run check           # what CI runs: format check + lints + type check
+npm run check           # format check + lints + type check
 ```
 
 If Rust isn't installed locally, the backend commands automatically run `cargo` inside the
 `rust:1-bookworm` Docker image (via `scripts/cargo.mjs`). Set `HOURWISE_CARGO=docker` to force that.
+`.editorconfig` and `.gitattributes` keep indentation and LF line endings consistent.
 
-You can also run each side on its own:
+
+---
+
+## Deploying to production
+
+See **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**:
+
+- Dokploy prerequisites and installation
+- the PostgreSQL service
+- backend and frontend applications (Dockerfile paths, build arguments, environment, volume,
+  health checks, update and rollback settings)
+- domain and HTTPS
+- backups and restore
+- deployment order, automatic deploys, rollbacks
+- a production checklist and troubleshooting
+
+### Docker images
 
 ```bash
-cd backend  && cargo fmt && cargo clippy --all-targets -- -D warnings
-cd frontend && npm run format && npm run lint && npm run typecheck
+docker build -t hourwise-backend ./backend
+docker build --build-arg BACKEND_URL=http://<backend-host>:8080 -t hourwise-frontend ./frontend
 ```
 
-`.github/workflows/ci.yml` runs the same checks plus both builds on every push and pull request.
-`.editorconfig` and `.gitattributes` keep indentation and LF line endings consistent across
-editors and Windows checkouts. With the Prettier and ESLint editor extensions installed,
-VS Code and JetBrains pick up these configs automatically, so you can enable format-on-save.
+**Backend image:**
+- multi-stage release build with cached dependencies
+- `debian:bookworm-slim` runtime with only `ca-certificates`
+- non-root user `hourwise` (uid 10001)
+- graceful shutdown on SIGTERM, which also closes the pool
+- `HEALTHCHECK` via `hourwise-backend healthcheck`
+- no secrets baked in
+
+**Frontend image:**
+- `npm ci` with the existing `package-lock.json`
+- Next.js `standalone` output, so no dev dependencies ship
+- non-root user `nextjs`
+- `HEALTHCHECK` on `/healthz`
 
 ---
 
-## Configuration
+## Security notes
 
-### Root `.env` (read by Docker Compose)
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| `JWT_SECRET` | *(required)* | Secret for signing login tokens. At least 32 characters. Changing it signs everyone out. |
-| `JWT_TTL_HOURS` | `168` | How long a login stays valid. |
-| `ADMIN_EMAIL` / `ADMIN_PASSWORD` / `ADMIN_NAME` | – | Initial admin, created on startup only when no admin exists. |
-| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `hourwise` | Credentials for the bundled Postgres container. |
-| `DATABASE_URL` | built from `POSTGRES_*` | Set this to use a **hosted** Postgres instead of the bundled one. |
-| `POSTGRES_PORT` / `BACKEND_PORT` / `FRONTEND_PORT` | `5432` / `8080` / `3000` | Host ports. |
+- `POST /api/auth/login` verifies the Argon2 hash and sets two cookies:
+  - `hw_session`: a signed JWT; `HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=<ttl>`
+  - `hw_csrf`: a random token bound to that session, readable by the page
+- Every non-GET request must send `X-CSRF-Token` matching the session's token, otherwise `403`.
+  Together with `SameSite=Strict` and JSON-only bodies this blocks cross-site request forgery.
+- The user row is re-read on every request: role changes and deactivation apply immediately.
+  `users.session_epoch` is part of each session. Changing your password, an admin password reset
+  or deactivation bumps it, which signs out every other session (your current browser gets a
+  fresh cookie after a self-service password change).
+- Failed logins are limited per email: 5 per 15 minutes by default, then `429` with
+  `Retry-After`. Unknown emails take the same time as wrong passwords, so the timing doesn't
+  reveal which emails have accounts.
+- All SQL is parameterised. Uploads are size-limited and magic-byte checked. CSV exports
+  neutralise spreadsheet formulas.
+- `POST /api/auth/logout` expires the cookies.
 
-### Backend environment (`backend/.env` when running with `cargo run`)
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| `DATABASE_URL` | *(required)* | Postgres connection string. |
-| `JWT_SECRET` | *(required)* | As above. |
-| `BIND_ADDR` | `0.0.0.0:8080` | Address the API listens on. |
-| `UPLOAD_DIR` | `./uploads` | Where profile pictures are stored. |
-| `CORS_ORIGIN` | *(unset)* | Only needed if a browser calls the API directly instead of through the Next.js proxy. |
-| `RUST_LOG` | `hourwise_backend=info,tower_http=info` | Log level. |
-
-### Using a hosted database (Neon / Supabase / RDS)
-
-1. Create a Postgres database with your provider and copy its connection string.
-2. Put it in `.env`, e.g. `DATABASE_URL=postgres://user:pass@host/db?sslmode=require`.
-3. Run `docker compose up -d --build backend frontend`. The bundled `db` service still starts
-   because it's a dependency, but it isn't used. The backend creates its tables on first start.
-
----
-
-## Architecture
-
-```
-Browser ──► Next.js (port 3000) ──/api/*, /uploads/*──► Rust API (port 8080) ──► PostgreSQL
-            pages + proxy                                axum + sqlx
-```
-
-- The browser only talks to the Next.js server, which proxies `/api/*` and `/uploads/*` to the
-  Rust backend (`rewrites` in `frontend/next.config.ts`). This means there's no CORS setup.
-  `BACKEND_URL` is resolved **at build time**; Docker passes it as a build arg.
-- Auth: `POST /api/auth/login` returns a JWT that the frontend stores in `localStorage` and
-  sends as `Authorization: Bearer …`. On every request the backend reloads the user, so
-  deactivation and role changes apply immediately.
-- Migrations live in `backend/migrations/`, are embedded in the binary and run automatically on startup.
-
-### Data model
-
-| Table | Purpose |
-| --- | --- |
-| `users` | email (unique, lower-cased), name, Argon2 hash, role (`admin`/`member`), job title, avatar, active flag |
-| `projects` | name, client, description, colour, archived flag |
-| `project_members` | which users may log time to which projects |
-| `time_entries` | user, project, date, minutes (1–1440), description |
+- **Network exposure:**
+  - Locally, PostgreSQL and the API are published on `127.0.0.1` only.
+  - In production, only the frontend has a public domain. The API and database are reachable
+    only on Dokploy's private network, and the database has no external port.
+- **HTTPS is required in production** because the cookies are `Secure`. Dokploy's Traefik
+  terminates TLS with Let's Encrypt.
+- **Response headers:** the frontend sends `X-Content-Type-Options`, `X-Frame-Options`,
+  `Referrer-Policy` and `Permissions-Policy` on every page.
+- **Known limits:**
+  - Login rate limits are per email+client address and per client address, so one client can't
+    lock an account for everyone, and spraying from one address is blocked. The client address
+    comes from `X-Forwarded-For` only when the connection comes from `TRUSTED_PROXIES`. Many
+    addresses together can still guess slowly. Argon2 work is capped (`PASSWORD_HASH_CONCURRENCY`)
+    so a login flood gets `503` instead of exhausting memory.
+  - The limiter is in memory, per backend instance, and reset by a restart. Run one backend replica.
+  - Logout clears the cookies in that browser only. A stolen cookie is valid until it expires
+    (`JWT_TTL_HOURS`), unless the user's password is changed or the user is deactivated.
+  - Avatars are served without authentication to anyone who knows the random file name.
 
 ### REST API
 
-All endpoints are under `/api`. Everything except `/health` and `/auth/login` requires a bearer token.
+All endpoints are under `/api`. Everything except `/health`, `/auth/login` and `/auth/logout`
+requires the session cookie, and non-GET requests also require `X-CSRF-Token`.
 
 | Method & path | Who | Description |
 | --- | --- | --- |
-| `POST /auth/login` | public | `{email, password}` → `{token, user}` |
+| `POST /auth/login` | public | `{email, password}` → `{user}` + session cookies |
+| `POST /auth/logout` | public | Clears the session cookies |
 | `GET /me` | user | Current user |
 | `PATCH /me` | user | `{name?, job_title?}` (email can't be changed here) |
-| `PUT /me/password` | user | `{current_password, new_password}` |
+| `PUT /me/password` | user | `{current_password, new_password}`; signs out other sessions |
 | `POST /me/avatar` | user | multipart `file` (PNG/JPEG/WEBP/GIF, ≤ 2 MB) |
 | `DELETE /me/avatar` | user | Remove profile picture |
 | `GET /projects` | user | Projects the user is a member of |
@@ -248,58 +439,66 @@ All endpoints are under `/api`. Everything except `/health` and `/auth/login` re
 
 Errors are returned as `{"error": "message"}` with the matching HTTP status.
 
+
 ---
 
 ## Project structure
 
 ```
 .
-├── docker-compose.yml        # db + backend + frontend
+├── docker-compose.yml        # local dev: db (PostgreSQL) + backend + frontend
+├── docker-compose.test.yml   # disposable PostgreSQL for the Rust tests
+├── docker-compose.e2e.yml    # isolated stack for the Playwright tests
+├── docs/DEPLOYMENT.md        # Dokploy deployment, backups, checklist
 ├── .env.example              # copy to .env
-├── package.json              # repo-level lint/format scripts (no dependencies)
-├── scripts/cargo.mjs         # runs cargo locally, or in Docker if Rust isn't installed
-├── .github/workflows/ci.yml  # format + lint + typecheck + build on every push/PR
+├── package.json              # repo-level scripts (no dependencies)
+├── scripts/
+│   ├── cargo.mjs             # runs cargo locally or in Docker; test-database guard
+│   ├── test-backend.mjs      # starts the disposable test server and runs cargo test
+│   ├── backup.mjs            # verified pg_dump backups of the local database
+│   ├── db-reset.mjs          # resets only the local dev database volume
+│   └── e2e.mjs               # starts the isolated stack and runs Playwright
+├── .github/workflows/ci.yml
 ├── backend/                  # Rust API
-│   ├── Cargo.toml
 │   ├── Dockerfile
-│   ├── migrations/           # SQL migrations (embedded, run at startup)
-│   └── src/
-│       ├── main.rs           # startup, router, admin seeding
-│       ├── config.rs         # env configuration
-│       ├── auth.rs           # Argon2, JWT, AuthUser/AdminUser extractors
-│       ├── error.rs          # AppError → JSON responses
-│       ├── models.rs         # DB row / response types
-│       └── routes/           # auth, me, projects, entries, admin
+│   ├── migrations/           # PostgreSQL migrations (embedded with sqlx::migrate!)
+│   ├── src/
+│   │   ├── main.rs           # CLI: serve | migrate | check-db | verify | healthcheck
+│   │   ├── lib.rs            # app + state construction (shared with tests)
+│   │   ├── db.rs             # PgPool, settings, args!, Record/FromRecord, destinations
+│   │   ├── migrate.rs        # migration runner
+│   │   ├── verify.rs         # read-only integrity report
+│   │   ├── config.rs         # env configuration (secrets redacted in Debug)
+│   │   ├── auth.rs           # Argon2 (+ concurrency limit), cookies, CSRF, rate limiting, extractors
+│   │   ├── client_ip.rs      # client address for rate limiting (TRUSTED_PROXIES)
+│   │   ├── error.rs          # AppError, SQLSTATE mapping, JSON responses
+│   │   ├── models.rs         # row / response types
+│   │   └── routes/           # health, auth, me, projects, entries, admin
+│   └── tests/                # common (harness), db, api, security
 └── frontend/                 # Next.js app
     ├── Dockerfile
-    ├── next.config.ts        # API proxy (rewrites)
+    ├── e2e/                  # Playwright specs
     └── src/
-        ├── app/
-        │   ├── login/        # sign in
-        │   ├── (app)/        # member interface: time, reports, profile
-        │   └── admin/        # admin interface: overview, projects, users, reports
+        ├── __tests__/        # Vitest + React Testing Library
+        ├── app/              # login, (app)/ member UI, admin/ UI, healthz route
         ├── components/       # UI kit, EntryModal, SummaryReport, PeriodNav, ...
-        └── lib/              # api client, auth context, time helpers, types
+        └── lib/              # api client, auth context, csv, hooks, time helpers, types
 ```
 
 ---
-
-## Production notes
-
-- Use a strong `JWT_SECRET` and database password, and put the app behind HTTPS (for example
-  Caddy, Nginx or Traefik in front of port 3000). Only port 3000 needs to be public; you can
-  remove the `ports:` mappings for `db` and `backend` in `docker-compose.yml`.
-- Back up the `pgdata` and `uploads` volumes regularly (see the commands above).
-- Weeks start on Monday. Dates are calendar dates (no time zone), so an entry logged for "Tuesday"
-  stays on Tuesday for everyone.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 | --- | --- |
-| `Set JWT_SECRET in .env` when running compose | Create `.env` from `.env.example` and set `JWT_SECRET`. |
-| Backend exits with `JWT_SECRET must be at least 32 characters` | Use a longer secret. |
-| Can't log in as admin after changing `ADMIN_PASSWORD` | The seed only runs when no admin exists. Reset with `docker compose down -v` (**deletes data**) or update the hash in the DB. |
-| "Port is already allocated" | Change `POSTGRES_PORT`, `BACKEND_PORT` or `FRONTEND_PORT` in `.env`. |
-| Frontend shows network errors in dev | Make sure the backend is running on `http://localhost:8080` or set `BACKEND_URL`. |
-| A member sees no projects in "Track time" | An admin needs to add them to an active project. |
+| `docker compose up`: `Set POSTGRES_PASSWORD in .env` | Copy `.env.example` to `.env` and fill it in. |
+| Backend exits with `DATABASE_URL must be set` (`npm run dev:backend`) | Create `backend/.env` from `backend/.env.example`. |
+| `database not reachable (attempt n/12)` | PostgreSQL isn't running (`npm run db:up`), or the password in `DATABASE_URL` doesn't match `POSTGRES_PASSWORD`. Percent-encode `@ : / #` in passwords. |
+| `password authentication failed` after changing `POSTGRES_PASSWORD` | The password is set only when the volume is first created. Change it back, change it in SQL (`ALTER USER hourwise PASSWORD '…'`), or reset the dev database. |
+| Port 5432 already in use | Another PostgreSQL is running locally. Set `POSTGRES_PORT=5433` in `.env` and the matching port in `backend/.env`. |
+| `migration N was modified after it was applied` | Restore the original migration file and add a new migration instead. |
+| `npm run test:backend`: `refusing to run: … same server as a protected database` | `HOURWISE_TEST_DATABASE_URL` points at a real server. Unset it to use the disposable one. |
+| `npm run test:backend`: `not marked as a disposable test server` | Use `docker-compose.test.yml`, or start your test server with `-c hourwise.disposable=on`. |
+| `cargo: The term 'cargo' is not recognized` | Use the `npm run …` scripts (they fall back to Docker), or install Rust with `winget install Rustlang.Rustup`. |
+| `/api/...` returns 502 from the frontend | The backend is down or `BACKEND_URL` was wrong at build time. Rebuild the frontend. |
+| Signed out right after login | Not served over HTTPS (production), or `COOKIE_SECURE=true` on a non-localhost HTTP address. |

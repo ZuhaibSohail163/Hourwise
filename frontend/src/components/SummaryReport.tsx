@@ -3,6 +3,7 @@
 import { format } from "date-fns";
 import { Download, ListChecks } from "lucide-react";
 import { useMemo } from "react";
+import { entriesToCsv } from "@/lib/csv";
 import type { TimeEntry } from "@/lib/types";
 import {
   type Period,
@@ -72,36 +73,7 @@ function BreakdownList({ buckets, total }: { buckets: Bucket[]; total: number })
 }
 
 function exportCsv(entries: TimeEntry[], filename: string) {
-  const header = [
-    "Date",
-    "Member",
-    "Email",
-    "Client",
-    "Project",
-    "Hours",
-    "Minutes",
-    "Decimal hours",
-    "Notes",
-  ];
-  const esc = (v: string) => `"${v.replace(/"/g, '""')}"`;
-  const rows = [...entries]
-    .sort((a, b) => a.entry_date.localeCompare(b.entry_date))
-    .map((e) =>
-      [
-        e.entry_date,
-        e.user_name,
-        e.user_email,
-        e.project_client ?? "",
-        e.project_name,
-        String(Math.floor(e.minutes / 60)),
-        String(e.minutes % 60),
-        formatDecimal(e.minutes),
-        e.description,
-      ]
-        .map(esc)
-        .join(","),
-    );
-  const blob = new Blob([[header.join(","), ...rows].join("\n")], {
+  const blob = new Blob([entriesToCsv(entries)], {
     type: "text/csv;charset=utf-8",
   });
   const url = URL.createObjectURL(blob);

@@ -1,27 +1,15 @@
-const TOKEN_KEY = "hourwise_token";
+// The session lives in an HttpOnly cookie set by the backend, so page scripts never see it.
+// State-changing requests echo the readable `hw_csrf` cookie in the `X-CSRF-Token` header.
 
-export function getToken(): string | null {
-  try {
-    return localStorage.getItem(TOKEN_KEY);
-  } catch {
-    return null;
-  }
-}
+const CSRF_COOKIE = "hw_csrf";
 
-export function setToken(token: string) {
-  try {
-    localStorage.setItem(TOKEN_KEY, token);
-  } catch {
-    /* storage unavailable */
+export function readCookie(name: string): string | null {
+  if (typeof document === "undefined") return null;
+  for (const part of document.cookie.split(";")) {
+    const [key, ...rest] = part.trim().split("=");
+    if (key === name) return decodeURIComponent(rest.join("="));
   }
-}
-
-export function clearToken() {
-  try {
-    localStorage.removeItem(TOKEN_KEY);
-  } catch {
-    /* storage unavailable */
-  }
+  return null;
 }
 
 export class ApiError extends Error {
@@ -38,12 +26,17 @@ interface RequestOptions {
   body?: unknown;
   form?: FormData;
   query?: Record<string, string | undefined | null>;
+  /** Redirect to /login when the session is missing or expired (default true). */
+  redirectOn401?: boolean;
 }
 
 export async function api<T = unknown>(path: string, opts: RequestOptions = {}): Promise<T> {
+  const method = opts.method ?? "GET";
   const headers: Record<string, string> = {};
-  const token = getToken();
-  if (token) headers.Authorization = `Bearer ${token}`;
+  if (method !== "GET") {
+    const csrf = readCookie(CSRF_COOKIE);
+    if (csrf) headers["X-CSRF-Token"] = csrf;
+  }
 
   let body: BodyInit | undefined;
   if (opts.form) {
@@ -63,10 +56,9 @@ export async function api<T = unknown>(path: string, opts: RequestOptions = {}):
     if (qs) url += `?${qs}`;
   }
 
-  const res = await fetch(url, { method: opts.method ?? "GET", headers, body });
+  const res = await fetch(url, { method, headers, body, credentials: "same-origin" });
 
-  if (res.status === 401 && path !== "/auth/login") {
-    clearToken();
+  if (res.status === 401 && path !== "/auth/login" && opts.redirectOn401 !== false) {
     if (typeof window !== "undefined" && !window.location.pathname.startsWith("/login")) {
       // Outside React (no router here); a full reload also clears stale session state.
       // eslint-disable-next-line @next/next/no-location-assign-relative-destination

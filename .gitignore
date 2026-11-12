@@ -30,3 +30,17 @@ Thumbs.db
 # ---- Misc ----
 coverage/
 *.log
+
+# Database backups and leftover local database files (may contain employee data)
+backups/
+*.dump
+backend/data/
+*.db
+*.db-wal
+*.db-shm
+*.backup.sql
+
+# Playwright
+frontend/test-results/
+frontend/playwright-report/
+frontend/blob-report/
