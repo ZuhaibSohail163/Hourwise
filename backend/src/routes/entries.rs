@@ -1,10 +1,10 @@
+use crate::db::Connection;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
 use chrono::{Duration, NaiveDate, Utc};
-use libsql::{Connection, Value};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -36,12 +36,12 @@ pub async fn list(
     let (from, to) = date_range(q.from, q.to)?;
     let sql = format!(
         "{ENTRY_SELECT}
-         WHERE te.user_id = ?1 AND te.entry_date BETWEEN ?2 AND ?3
-           AND (?4 IS NULL OR te.project_id = ?4)
+         WHERE te.user_id = $1 AND te.entry_date BETWEEN $2 AND $3
+           AND ($4 IS NULL OR te.project_id = $4)
          ORDER BY te.entry_date DESC, te.created_at DESC"
     );
-    let conn = state.db.conn().await?;
-    let entries = db::query_all(&conn, &sql, args![user.id, from, to, q.project_id]).await?;
+    let mut conn = state.db.conn().await?;
+    let entries = db::query_all(&mut conn, &sql, args![user.id, from, to, q.project_id]).await?;
     Ok(Json(entries))
 }
 
@@ -82,32 +82,36 @@ pub fn fits_in_day(existing: i64, minutes: i32) -> bool {
 /// Shared validation for create and update. Runs inside the write transaction so the
 /// daily-total check and the write are atomic.
 async fn validate(
-    conn: &Connection,
+    conn: &mut Connection,
     user_id: Uuid,
     input: &EntryInput,
     existing_id: Option<Uuid>,
 ) -> AppResult<()> {
     validate_input(input, Utc::now().date_naive())?;
 
+    // Serialise this user's concurrent writes until the transaction ends, so two requests can't
+    // both read the old daily total and together exceed 24h. Other users are not blocked.
+    db::lock_user(conn, user_id).await?;
+
     // Users may only log time to non-archived projects they are a member of.
-    let archived = db::query_value(
+    let archived = db::query_scalar::<bool>(
         conn,
         "SELECT p.is_archived FROM projects p
          JOIN project_members pm ON pm.project_id = p.id
-         WHERE p.id = ?1 AND pm.user_id = ?2",
+         WHERE p.id = $1 AND pm.user_id = $2",
         args![input.project_id, user_id],
     )
     .await?;
     match archived {
         None => return Err(AppError::bad("You are not a member of that project")),
-        Some(Value::Integer(0)) => {}
-        Some(_) => return Err(AppError::bad("That project is archived")),
+        Some(false) => {}
+        Some(true) => return Err(AppError::bad("That project is archived")),
     }
 
     let day_total = db::query_i64(
         conn,
         "SELECT COALESCE(SUM(minutes), 0) FROM time_entries
-         WHERE user_id = ?1 AND entry_date = ?2 AND (?3 IS NULL OR id <> ?3)",
+         WHERE user_id = $1 AND entry_date = $2 AND ($3 IS NULL OR id <> $3)",
         args![user_id, input.entry_date, existing_id],
     )
     .await?;
@@ -117,8 +121,8 @@ async fn validate(
     Ok(())
 }
 
-async fn fetch_view(conn: &Connection, id: Uuid) -> AppResult<TimeEntryView> {
-    let sql = format!("{ENTRY_SELECT} WHERE te.id = ?1");
+async fn fetch_view(conn: &mut Connection, id: Uuid) -> AppResult<TimeEntryView> {
+    let sql = format!("{ENTRY_SELECT} WHERE te.id = $1");
     db::query_one(conn, &sql, args![id]).await
 }
 
@@ -128,17 +132,17 @@ pub async fn create(
     Json(input): Json<EntryInput>,
 ) -> AppResult<(StatusCode, Json<TimeEntryView>)> {
     validate_input(&input, Utc::now().date_naive())?;
-    let conn = state.db.conn().await?;
+    let mut conn = state.db.conn().await?;
     let id = Uuid::new_v4();
     let now = db::now_ts();
 
-    let tx = db::write_tx(&conn).await?;
-    validate(&tx, user.id, &input, None).await?;
+    let mut tx = db::write_tx(&mut conn).await?;
+    validate(&mut tx, user.id, &input, None).await?;
     db::execute(
-        &tx,
+        &mut tx,
         "INSERT INTO time_entries
             (id, user_id, project_id, entry_date, minutes, description, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $7)",
         args![
             id,
             user.id,
@@ -151,7 +155,7 @@ pub async fn create(
     )
     .await?;
     tx.commit().await?;
-    Ok((StatusCode::CREATED, Json(fetch_view(&conn, id).await?)))
+    Ok((StatusCode::CREATED, Json(fetch_view(&mut conn, id).await?)))
 }
 
 pub async fn update(
@@ -160,24 +164,24 @@ pub async fn update(
     Path(id): Path<Uuid>,
     Json(input): Json<EntryInput>,
 ) -> AppResult<Json<TimeEntryView>> {
-    let conn = state.db.conn().await?;
-    let tx = db::write_tx(&conn).await?;
-    let owner = db::query_value(
-        &tx,
-        "SELECT user_id FROM time_entries WHERE id = ?1",
+    let mut conn = state.db.conn().await?;
+    let mut tx = db::write_tx(&mut conn).await?;
+    let owner = db::query_scalar::<Uuid>(
+        &mut tx,
+        "SELECT user_id FROM time_entries WHERE id = $1",
         args![id],
     )
     .await?;
     // Another user's entry is reported as "not found" so ids can't be probed.
-    if owner != Some(Value::Text(user.id.hyphenated().to_string())) {
+    if owner != Some(user.id) {
         return Err(AppError::not_found("Time entry"));
     }
-    validate(&tx, user.id, &input, Some(id)).await?;
+    validate(&mut tx, user.id, &input, Some(id)).await?;
     db::execute(
-        &tx,
+        &mut tx,
         "UPDATE time_entries
-         SET project_id = ?2, entry_date = ?3, minutes = ?4, description = ?5, updated_at = ?6
-         WHERE id = ?1",
+         SET project_id = $2, entry_date = $3, minutes = $4, description = $5, updated_at = $6
+         WHERE id = $1",
         args![
             id,
             input.project_id,
@@ -189,7 +193,7 @@ pub async fn update(
     )
     .await?;
     tx.commit().await?;
-    Ok(Json(fetch_view(&conn, id).await?))
+    Ok(Json(fetch_view(&mut conn, id).await?))
 }
 
 pub async fn remove(
@@ -197,10 +201,10 @@ pub async fn remove(
     AuthUser(user): AuthUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<StatusCode> {
-    let conn = state.db.conn().await?;
+    let mut conn = state.db.conn().await?;
     let affected = db::execute(
-        &conn,
-        "DELETE FROM time_entries WHERE id = ?1 AND user_id = ?2",
+        &mut conn,
+        "DELETE FROM time_entries WHERE id = $1 AND user_id = $2",
         args![id, user.id],
     )
     .await?;

@@ -8,7 +8,7 @@ publish = false
 axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
-libsql = { version = "0.9.30", default-features = false, features = ["core", "remote", "tls"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "uuid", "chrono", "migrate", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -41,7 +41,7 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
 
-# Optimize dependencies (Argon2, SQLite) in debug/test builds; otherwise password hashing makes
+# Optimize dependencies (Argon2) in debug/test builds; otherwise password hashing makes
 # the test suite very slow. Our own crate still compiles quickly with debug settings.
 [profile.dev.package."*"]
 opt-level = 2

@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::{
     args,
-    auth::{hash_password, validate_password, verify_password, AuthUser},
+    auth::{validate_password, AuthUser},
     db,
     error::{AppError, AppResult},
     models::User,
@@ -50,10 +50,10 @@ pub async fn update_me(
         Some(t) => clean(Some(t)),
         None => user.job_title.clone(),
     };
-    let conn = state.db.conn().await?;
+    let mut conn = state.db.conn().await?;
     let updated: User = db::query_one(
-        &conn,
-        "UPDATE users SET name = ?2, job_title = ?3, updated_at = ?4 WHERE id = ?1 RETURNING *",
+        &mut conn,
+        "UPDATE users SET name = $2, job_title = $3, updated_at = $4 WHERE id = $1 RETURNING *",
         args![user.id, name, job_title, db::now_ts()],
     )
     .await?;
@@ -71,17 +71,21 @@ pub async fn change_password(
     AuthUser(user): AuthUser,
     Json(body): Json<ChangePassword>,
 ) -> AppResult<(StatusCode, HeaderMap)> {
-    if !verify_password(body.current_password, user.password_hash.clone()).await {
+    if !state
+        .hashing
+        .verify(body.current_password, user.password_hash.clone())
+        .await?
+    {
         return Err(AppError::bad("Current password is incorrect"));
     }
     validate_password(&body.new_password)?;
-    let hash = hash_password(body.new_password).await?;
-    let conn = state.db.conn().await?;
+    let hash = state.hashing.hash(body.new_password).await?;
+    let mut conn = state.db.conn().await?;
     // Bumping the epoch signs out every other browser/device; this one gets a fresh session.
     let updated: User = db::query_one(
-        &conn,
-        "UPDATE users SET password_hash = ?2, session_epoch = session_epoch + 1, updated_at = ?3
-         WHERE id = ?1 RETURNING *",
+        &mut conn,
+        "UPDATE users SET password_hash = $2, session_epoch = session_epoch + 1, updated_at = $3
+         WHERE id = $1 RETURNING *",
         args![user.id, hash, db::now_ts()],
     )
     .await?;
@@ -161,10 +165,10 @@ pub async fn upload_avatar(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    let conn = state.db.conn().await?;
+    let mut conn = state.db.conn().await?;
     let updated: User = db::query_one(
-        &conn,
-        "UPDATE users SET avatar_url = ?2, updated_at = ?3 WHERE id = ?1 RETURNING *",
+        &mut conn,
+        "UPDATE users SET avatar_url = $2, updated_at = $3 WHERE id = $1 RETURNING *",
         args![
             user.id,
             format!("/uploads/avatars/{filename}"),
@@ -181,10 +185,10 @@ pub async fn delete_avatar(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
 ) -> AppResult<Json<User>> {
-    let conn = state.db.conn().await?;
+    let mut conn = state.db.conn().await?;
     let updated: User = db::query_one(
-        &conn,
-        "UPDATE users SET avatar_url = NULL, updated_at = ?2 WHERE id = ?1 RETURNING *",
+        &mut conn,
+        "UPDATE users SET avatar_url = NULL, updated_at = $2 WHERE id = $1 RETURNING *",
         args![user.id, db::now_ts()],
     )
     .await?;

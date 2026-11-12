@@ -8,7 +8,8 @@
 
 use std::{
     collections::HashMap,
-    sync::Mutex,
+    net::IpAddr,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -24,6 +25,7 @@ use chrono::Utc;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::{
@@ -52,31 +54,86 @@ pub struct Claims {
     pub exp: usize,
 }
 
-pub async fn hash_password(password: String) -> AppResult<String> {
-    // Argon2 is deliberately CPU heavy: keep it off the async executor.
-    tokio::task::spawn_blocking(move || {
-        let salt = SaltString::generate(&mut OsRng);
-        Argon2::default()
-            .hash_password(password.as_bytes(), &salt)
-            .map(|h| h.to_string())
-            .map_err(|e| AppError::Internal(e.to_string()))
-    })
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?
+fn hash_blocking(password: &str) -> AppResult<String> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| AppError::Internal(e.to_string()))
 }
 
+fn verify_blocking(password: &str, hash: &str) -> bool {
+    PasswordHash::new(hash)
+        .map(|parsed| {
+            Argon2::default()
+                .verify_password(password.as_bytes(), &parsed)
+                .is_ok()
+        })
+        .unwrap_or(false)
+}
+
+/// Hashes without a concurrency limit. Request handlers use [`HashLimiter::hash`] instead; this is
+/// for startup (seeding the admin) and tests.
+pub async fn hash_password(password: String) -> AppResult<String> {
+    // Argon2 is deliberately CPU heavy: keep it off the async executor.
+    tokio::task::spawn_blocking(move || hash_blocking(&password))
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+}
+
+/// Verifies without a concurrency limit (see [`hash_password`]).
 pub async fn verify_password(password: String, hash: String) -> bool {
-    tokio::task::spawn_blocking(move || {
-        PasswordHash::new(&hash)
-            .map(|parsed| {
-                Argon2::default()
-                    .verify_password(password.as_bytes(), &parsed)
-                    .is_ok()
-            })
-            .unwrap_or(false)
-    })
-    .await
-    .unwrap_or(false)
+    tokio::task::spawn_blocking(move || verify_blocking(&password, &hash))
+        .await
+        .unwrap_or(false)
+}
+
+/// Caps how many Argon2 operations (each uses ~19 MiB of memory and a CPU core for a while) run
+/// at once, so a flood of logins can't exhaust the server. A request that can't get a slot within
+/// `wait` fails with [`AppError::Busy`] (503) instead of queueing without limit.
+pub struct HashLimiter {
+    slots: Arc<Semaphore>,
+    wait: Duration,
+}
+
+impl HashLimiter {
+    pub fn new(max_concurrent: usize, wait: Duration) -> Self {
+        Self {
+            slots: Arc::new(Semaphore::new(max_concurrent.max(1))),
+            wait,
+        }
+    }
+
+    /// Runs `work` on the blocking thread pool while holding a slot. The slot is released when
+    /// `work` finishes, even if the request was cancelled in the meantime.
+    pub async fn run<T, F>(&self, work: F) -> AppResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let permit = match tokio::time::timeout(self.wait, self.slots.clone().acquire_owned()).await
+        {
+            Ok(Ok(permit)) => permit,
+            _ => {
+                tracing::warn!("password hashing is at capacity; request refused with 503");
+                return Err(AppError::Busy);
+            }
+        };
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work()
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))
+    }
+
+    pub async fn hash(&self, password: String) -> AppResult<String> {
+        self.run(move || hash_blocking(&password)).await?
+    }
+
+    pub async fn verify(&self, password: String, hash: String) -> AppResult<bool> {
+        self.run(move || verify_blocking(&password, &hash)).await
+    }
 }
 
 /// A valid Argon2 hash of a random string. Verifying against it when an email is unknown keeps
@@ -193,51 +250,136 @@ pub fn read_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
 
 // ---------------------------------------------------------------- rate limiting
 
-/// In-memory limiter for failed logins, keyed by email. After `max_failures` failures within
-/// `window`, further attempts for that email are refused until the window expires. A successful
-/// login clears the counter. (Single-instance deployments; see README for multi-instance notes.)
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum LimitKey {
+    /// One email from one client address.
+    Account(String, IpAddr),
+    /// One client address, across all emails (password spraying).
+    Ip(IpAddr),
+}
+
+/// In-memory limiter for failed logins. It has two counters, both over the same `window`:
+///
+/// - **per email and client IP** (`max_per_account`). One client can't keep guessing a
+///   password, but it also can't lock the account for anyone else: the real user signs in from
+///   another address. There is deliberately no per-email-only lock, because that would let
+///   anyone lock out any known email.
+/// - **per client IP** (`max_per_ip`, across all emails). This stops one client from spraying a
+///   few common passwords over many accounts.
+///
+/// Every attempt is counted when it **starts** ([`LoginLimiter::begin`]), so many simultaneous
+/// requests can't all pass the check before the first failure is recorded. A successful login
+/// refunds its attempt and clears that email+IP counter. An attempt that never reached the
+/// password check (server busy, database error) is refunded too.
+///
+/// The state is per process: run one backend replica (see docs/DEPLOYMENT.md).
 pub struct LoginLimiter {
-    max_failures: u32,
+    max_per_account: u32,
+    max_per_ip: u32,
     window: Duration,
-    entries: Mutex<HashMap<String, (u32, Instant)>>,
+    entries: Mutex<HashMap<LimitKey, (u32, Instant)>>,
 }
 
 impl LoginLimiter {
-    pub fn new(max_failures: u32, window: Duration) -> Self {
+    pub fn new(max_per_account: u32, max_per_ip: u32, window: Duration) -> Self {
         Self {
-            max_failures: max_failures.max(1),
+            max_per_account: max_per_account.max(1),
+            max_per_ip: max_per_ip.max(1),
             window,
             entries: Mutex::new(HashMap::new()),
         }
     }
 
-    /// `Err(seconds_remaining)` while the key is locked out.
-    pub fn check(&self, key: &str) -> Result<(), u64> {
+    fn keys(email: &str, ip: IpAddr) -> [(LimitKey, bool); 2] {
+        [
+            (LimitKey::Ip(ip), true),
+            (LimitKey::Account(email.to_string(), ip), false),
+        ]
+    }
+
+    fn max_for(&self, per_ip: bool) -> u32 {
+        if per_ip {
+            self.max_per_ip
+        } else {
+            self.max_per_account
+        }
+    }
+
+    /// Reserves one attempt for `email` from `ip`, or `Err(seconds_remaining)` while either
+    /// counter is at its limit. The returned guard refunds the attempt unless
+    /// [`LoginAttempt::failed`] is called.
+    pub fn begin(&self, email: &str, ip: IpAddr) -> Result<LoginAttempt<'_>, u64> {
         let mut map = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
         map.retain(|_, (_, start)| now.duration_since(*start) < self.window);
-        match map.get(key) {
-            Some((count, start)) if *count >= self.max_failures => {
-                let left = self.window.saturating_sub(now.duration_since(*start));
-                Err(left.as_secs().max(1))
+        let keys = Self::keys(email, ip);
+        let locked = keys
+            .iter()
+            .filter_map(|(key, per_ip)| {
+                map.get(key)
+                    .filter(|(count, _)| *count >= self.max_for(*per_ip))
+                    .map(|(_, start)| self.window.saturating_sub(now.duration_since(*start)))
+            })
+            .max();
+        if let Some(left) = locked {
+            return Err(left.as_secs().max(1));
+        }
+        for (key, _) in keys {
+            map.entry(key).or_insert((0, now)).0 += 1;
+        }
+        Ok(LoginAttempt {
+            limiter: self,
+            email: email.to_string(),
+            ip,
+            outcome: Outcome::Refund,
+        })
+    }
+
+    fn refund(&self, email: &str, ip: IpAddr, clear_account: bool) {
+        let mut map = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        for (key, per_ip) in Self::keys(email, ip) {
+            if !per_ip && clear_account {
+                map.remove(&key);
+            } else if let Some(entry) = map.get_mut(&key) {
+                entry.0 = entry.0.saturating_sub(1);
             }
-            _ => Ok(()),
         }
     }
+}
 
-    pub fn record_failure(&self, key: &str) {
-        let mut map = self.entries.lock().unwrap_or_else(|p| p.into_inner());
-        let now = Instant::now();
-        let entry = map.entry(key.to_string()).or_insert((0, now));
-        if now.duration_since(entry.1) >= self.window {
-            *entry = (0, now);
-        }
-        entry.0 += 1;
+enum Outcome {
+    Refund,
+    Failed,
+    Succeeded,
+}
+
+/// One reserved login attempt (see [`LoginLimiter::begin`]).
+pub struct LoginAttempt<'a> {
+    limiter: &'a LoginLimiter,
+    email: String,
+    ip: IpAddr,
+    outcome: Outcome,
+}
+
+impl LoginAttempt<'_> {
+    /// Wrong email or password: the attempt stays counted.
+    pub fn failed(mut self) {
+        self.outcome = Outcome::Failed;
     }
 
-    pub fn reset(&self, key: &str) {
-        let mut map = self.entries.lock().unwrap_or_else(|p| p.into_inner());
-        map.remove(key);
+    /// Correct password: the attempt is refunded and the email+IP counter cleared.
+    pub fn succeeded(mut self) {
+        self.outcome = Outcome::Succeeded;
+    }
+}
+
+impl Drop for LoginAttempt<'_> {
+    fn drop(&mut self) {
+        match self.outcome {
+            Outcome::Failed => {}
+            Outcome::Refund => self.limiter.refund(&self.email, self.ip, false),
+            Outcome::Succeeded => self.limiter.refund(&self.email, self.ip, true),
+        }
     }
 }
 
@@ -274,10 +416,10 @@ impl FromRequestParts<AppState> for AuthUser {
             }
         }
 
-        let conn = state.db.conn().await?;
+        let mut conn = state.db.conn().await?;
         let user: User = db::query_opt(
-            &conn,
-            "SELECT * FROM users WHERE id = ?1",
+            &mut conn,
+            "SELECT * FROM users WHERE id = $1",
             args![claims.sub],
         )
         .await?
@@ -398,26 +540,150 @@ mod tests {
         assert!(!constant_time_eq("", "a"));
     }
 
+    fn ip(s: &str) -> IpAddr {
+        s.parse()
+            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+    }
+
+    fn fail(l: &LoginLimiter, email: &str, from: &str) -> bool {
+        l.begin(email, ip(from)).map(LoginAttempt::failed).is_ok()
+    }
+
     #[test]
-    fn limiter_locks_after_max_failures_and_resets() {
-        let l = LoginLimiter::new(3, Duration::from_secs(60));
+    fn limiter_locks_an_email_only_for_the_failing_address() {
+        let l = LoginLimiter::new(3, 100, Duration::from_secs(60));
         for _ in 0..3 {
-            assert!(l.check("x").is_ok());
-            l.record_failure("x");
+            assert!(fail(&l, "victim", "198.51.100.1"));
         }
-        assert!(l.check("x").is_err());
-        assert!(l.check("other").is_ok());
-        l.reset("x");
-        assert!(l.check("x").is_ok());
+        assert!(l.begin("victim", ip("198.51.100.1")).is_err());
+        // The real user, from another address, is not locked out.
+        assert!(l.begin("victim", ip("203.0.113.5")).is_ok());
+        // The attacker can still try other emails until the per-IP limit.
+        assert!(l.begin("other", ip("198.51.100.1")).is_ok());
+    }
+
+    #[test]
+    fn limiter_blocks_password_spraying_per_address() {
+        let l = LoginLimiter::new(3, 5, Duration::from_secs(60));
+        for i in 0..5 {
+            assert!(fail(&l, &format!("user{i}"), "198.51.100.1"));
+        }
+        let left = l.begin("user99", ip("198.51.100.1")).err();
+        assert!(left.is_some_and(|s| (1..=60).contains(&s)));
+        assert!(l.begin("user99", ip("203.0.113.5")).is_ok());
+    }
+
+    #[test]
+    fn limiter_success_and_refunds() {
+        let l = LoginLimiter::new(3, 4, Duration::from_secs(60));
+        assert!(fail(&l, "x", "198.51.100.1"));
+        assert!(fail(&l, "x", "198.51.100.1"));
+        // Success clears the email+IP counter and doesn't count against the address.
+        if let Ok(a) = l.begin("x", ip("198.51.100.1")) {
+            a.succeeded();
+        }
+        for _ in 0..2 {
+            assert!(fail(&l, "x", "198.51.100.1"));
+        }
+        // Per IP: 4 failures so far, so the address is now blocked.
+        assert!(l.begin("y", ip("198.51.100.1")).is_err());
+
+        // An attempt dropped without an outcome (server busy, database error) is refunded.
+        let l = LoginLimiter::new(1, 1, Duration::from_secs(60));
+        for _ in 0..5 {
+            drop(l.begin("x", ip("198.51.100.1")));
+        }
+        assert!(l.begin("x", ip("198.51.100.1")).is_ok());
+    }
+
+    #[test]
+    fn limiter_counts_attempts_while_they_are_in_flight() {
+        let l = LoginLimiter::new(2, 100, Duration::from_secs(60));
+        let a = l.begin("x", ip("198.51.100.1"));
+        let b = l.begin("x", ip("198.51.100.1"));
+        assert!(a.is_ok() && b.is_ok());
+        // Two attempts are still being checked: a third concurrent one is refused.
+        assert!(l.begin("x", ip("198.51.100.1")).is_err());
+        drop((a, b));
+        assert!(l.begin("x", ip("198.51.100.1")).is_ok());
     }
 
     #[test]
     fn limiter_window_expires() {
-        let l = LoginLimiter::new(1, Duration::from_millis(30));
-        l.record_failure("x");
-        assert!(l.check("x").is_err());
+        let l = LoginLimiter::new(1, 1, Duration::from_millis(30));
+        assert!(fail(&l, "x", "198.51.100.1"));
+        assert!(l.begin("x", ip("198.51.100.1")).is_err());
         std::thread::sleep(Duration::from_millis(40));
-        assert!(l.check("x").is_ok());
+        assert!(l.begin("x", ip("198.51.100.1")).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hash_limiter_caps_concurrency() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let limiter = Arc::new(HashLimiter::new(4, Duration::from_secs(30)));
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let tasks: Vec<_> = (0..16)
+            .map(|_| {
+                let (limiter, running, peak) = (limiter.clone(), running.clone(), peak.clone());
+                tokio::spawn(async move {
+                    limiter
+                        .run(move || {
+                            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(40));
+                            running.fetch_sub(1, Ordering::SeqCst);
+                        })
+                        .await
+                        .is_ok()
+                })
+            })
+            .collect();
+        let mut done = 0;
+        for t in tasks {
+            done += usize::from(t.await.unwrap_or(false));
+        }
+        assert_eq!(done, 16, "every job eventually got a slot");
+        assert_eq!(peak.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hash_limiter_refuses_when_saturated_and_recovers() {
+        let limiter = Arc::new(HashLimiter::new(1, Duration::from_millis(50)));
+        let busy = limiter.clone();
+        let slow = tokio::spawn(async move {
+            busy.run(|| std::thread::sleep(Duration::from_millis(400)))
+                .await
+                .is_ok()
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(matches!(limiter.run(|| ()).await, Err(AppError::Busy)));
+        assert!(slow.await.unwrap_or(false));
+        // Once the slot is free again, work runs normally.
+        let hash = limiter
+            .hash("correct horse".into())
+            .await
+            .unwrap_or_default();
+        assert_eq!(
+            limiter.verify("correct horse".into(), hash).await.ok(),
+            Some(true)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hash_limiter_holds_the_slot_after_the_caller_is_cancelled() {
+        let limiter = Arc::new(HashLimiter::new(1, Duration::from_millis(50)));
+        let cancelled = limiter.clone();
+        let task = tokio::spawn(async move {
+            let _ = cancelled
+                .run(|| std::thread::sleep(Duration::from_millis(400)))
+                .await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The client went away, but the hash is still running: the slot is still taken.
+        task.abort();
+        let _ = task.await;
+        assert!(matches!(limiter.run(|| ()).await, Err(AppError::Busy)));
     }
 
     #[test]

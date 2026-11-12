@@ -1,0 +1,38 @@
+# Disposable PostgreSQL server for the Rust integration tests (`npm run test:backend`).
+#
+# - Separate compose project (`hourwise-test`) and port (127.0.0.1:55432), so it never touches the
+#   development database or its volume.
+# - Data lives on tmpfs: nothing survives `down`, and durability is switched off for speed.
+# - `hourwise.disposable=on` is the marker the test harness requires before it creates or drops
+#   anything (backend/tests/common/mod.rs). Never set it on a real server.
+# - The credentials are throwaway test values for this local-only container, not secrets.
+name: hourwise-test
+
+services:
+  postgres-test:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: hourwise_test
+      POSTGRES_PASSWORD: hourwise_test
+      POSTGRES_DB: postgres
+    command:
+      - postgres
+      - -c
+      - hourwise.disposable=on
+      - -c
+      - max_connections=400
+      - -c
+      - fsync=off
+      - -c
+      - synchronous_commit=off
+      - -c
+      - full_page_writes=off
+    tmpfs:
+      - /var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hourwise_test -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

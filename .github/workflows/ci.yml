@@ -7,7 +7,7 @@ on:
 
 jobs:
   backend:
-    name: Backend (fmt + clippy + tests + build)
+    name: Backend (fmt + clippy + PostgreSQL tests + build)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -22,9 +22,23 @@ jobs:
           workspaces: backend
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
-      # Unit + database + API + security tests, each on its own temporary libSQL file.
-      - run: cargo test --locked
+      # Disposable PostgreSQL (tmpfs, marked hourwise.disposable=on). Each test creates and
+      # drops its own database on it.
+      - name: Start the disposable PostgreSQL test server
+        run: docker compose -f ../docker-compose.test.yml -p hourwise-test up -d --wait
+      - name: Unit + database + API + security tests
+        run: cargo test --locked
+        env:
+          HOURWISE_TEST_DATABASE_URL: postgres://hourwise_test:hourwise_test@localhost:55432/postgres
       - run: cargo build --locked
+
+  images:
+    name: Production Docker images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t hourwise-backend ./backend
+      - run: docker build --build-arg BACKEND_URL=http://backend:8080 -t hourwise-frontend ./frontend
 
   frontend:
     name: Frontend (prettier + eslint + tsc + vitest + build)

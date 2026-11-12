@@ -10,30 +10,40 @@ Hourwise is a team time-tracking web app (Harvest-like). There are two roles:
   work through a separate `/admin` interface.
 
 ## Layout
-- `backend/`: Rust API (axum 0.8, **libsql** 0.9 for Turso Cloud or a local SQLite file, argon2,
-  jsonwebtoken). It's a lib + bin crate: `src/lib.rs` builds the app and state (shared with the
-  tests); `src/main.rs` is the CLI (`serve | migrate | check-db | verify | backup | restore`).
-  - `src/db.rs`: `Db` (one connection per request via `state.db.conn()`), the `args![]` macro, the
-    `Bind` trait, `Record` row accessors, `FromRecord`, `query_all/opt/one/value/i64`, `execute`,
-    and `write_tx` (`BEGIN IMMEDIATE`).
-  - `src/migrate.rs`: embedded migrations list + checksums. `src/backup.rs`: export/import/verify.
-  - `src/routes/mod.rs` defines the router and shared helpers (`date_range`, `clean`, validators).
+- `backend/`: Rust API (axum 0.8, **SQLx 0.8 + PostgreSQL**, argon2, jsonwebtoken). It's a lib + bin
+  crate: `src/lib.rs` builds the app and state (shared with the tests); `src/main.rs` is the CLI
+  (`serve | migrate | check-db | verify | healthcheck [--ready]`).
+  - `src/db.rs`: `Db` (a `PgPool`; one pooled connection per request via `state.db.conn()`),
+    `DbSettings` (`DATABASE_URL` + pool limits; the password never appears in Debug or logs), the
+    `args![]` macro, `Record` row accessors, `FromRecord`, `query_all/opt/one/scalar/i64`, `execute`,
+    `write_tx`, `lock_user` (`SELECT … FOR UPDATE`), and `destination()` (normalised host/port/db,
+    used by the test guard).
+  - `src/migrate.rs`: `sqlx::migrate!` (checksums in `_sqlx_migrations`, advisory lock).
+    `src/verify.rs`: read-only integrity report.
+  - `src/routes/mod.rs` defines the router, the health endpoints and shared helpers (`date_range`,
+    `clean`, validators).
   - `src/routes/admin.rs` holds every `/api/admin/*` endpoint.
-  - `src/auth.rs`: Argon2, session cookies, CSRF, `LoginLimiter`, and the `AuthUser` / `AdminUser`
+  - `src/auth.rs`: Argon2, session cookies, CSRF, `LoginLimiter`, `HashLimiter`, and the `AuthUser` / `AdminUser`
     extractors. **Every protected handler must take one of them**; `AdminUser` is what enforces
     admin-only access, and `AuthUser` enforces CSRF on non-GET requests.
-  - `migrations/`: SQLite-dialect SQL, embedded in the binary.
-  - `tests/`: `common/mod.rs` (TestApp harness: temp DB per test, cookie sessions), `db.rs`,
-    `api.rs`, `security.rs`, `turso_cloud.rs` (`#[ignore]`, needs an empty test DB).
+    In handlers, hash and verify passwords with `state.hashing.hash/verify` (the concurrency limit),
+    never the bare `hash_password`/`verify_password` (startup and tests only).
+  - `src/client_ip.rs`: `ClientIp` extractor. `X-Forwarded-For` is used only when the TCP peer is in
+    `TRUSTED_PROXIES` (rightmost untrusted entry); otherwise the peer address. Never read that header elsewhere.
+    The login limiter is keyed per email+IP and per IP, never per email alone (that would allow lockout abuse).
+  - `migrations/`: PostgreSQL SQL, embedded in the binary.
+  - `tests/`: `common/mod.rs` (TestApp harness: a fresh database per test on the disposable test
+    server, cookie sessions, production guard), `db.rs`, `api.rs`, `security.rs`.
 - `frontend/`: Next.js 16 App Router, React 19, TypeScript, Tailwind CSS v4 (configured in CSS with `@theme` in `globals.css`).
-  - `src/app/(app)/` is the member interface (top nav). `src/app/admin/` is the admin interface (dark sidebar). Each `layout.tsx` guards its own role.
+  - `src/app/(app)/` is the member interface (top nav). `src/app/admin/` is the admin interface (dark sidebar). Each `layout.tsx` guards its own role. `src/app/healthz/route.ts` is the liveness probe.
   - All pages are client components that call the API through `src/lib/api.ts` (`api<T>(path, {method, body, query, form})`).
     It sends cookies and the `X-CSRF-Token` header automatically. There is no token in JS or localStorage.
   - `src/components/SummaryReport.tsx` is the shared report (totals, charts, work log, CSV via `lib/csv.ts`).
   - `src/lib/time.ts` has date and duration helpers. Weeks start Monday (`WEEK_OPTS`).
   - Tests: `src/__tests__/*.test.ts(x)` (Vitest + RTL, `src/test/` holds setup and fixtures) and `e2e/` (Playwright).
-- `docker-compose.yml`: `backend`, `frontend` (there is no database container: Turso Cloud or a local file in the `dbdata` volume).
-  `docker-compose.e2e.yml`: isolated tmpfs stack for Playwright.
+- `docker-compose.yml`: `db` (PostgreSQL 17, volume `postgres_data`, port bound to 127.0.0.1), `backend`, `frontend`.
+  `docker-compose.test.yml`: disposable tmpfs PostgreSQL for the Rust tests (127.0.0.1:55432, `hourwise.disposable=on`).
+  `docker-compose.e2e.yml`: isolated tmpfs stack for Playwright. `docs/DEPLOYMENT.md`: Dokploy production setup.
 
 ## Commands
 **Before finishing any change, run `npm run format`, `npm run check` and `npm test` from the repo root.**
@@ -42,33 +52,35 @@ All must pass with zero warnings, because CI enforces the same checks.
 npm run format                        # rustfmt + prettier (repo root)
 npm run lint                          # clippy -D warnings + eslint --max-warnings=0
 npm run check                         # format check + lints + tsc
-npm test                              # cargo test (unit + db + api + security) + vitest
+npm test                              # Rust tests (starts the disposable PostgreSQL) + vitest
+npm run test:backend -- --test api    # one Rust test file
 npm run test:e2e                      # Playwright on the isolated stack (ports 3100/8180)
-npm run test:turso                    # real Turso; needs HOURWISE_TEST_TURSO_URL/TOKEN for an EMPTY db
-npm run backup                        # verified logical backup -> backups/
-docker compose up -d --build          # full stack at http://localhost:3000 (local DB unless TURSO_* set)
-docker compose exec backend hourwise-backend verify   # integrity report
+npm run backup                        # verified pg_dump backup of the local db -> backups/
+docker compose up -d --build          # full stack at http://localhost:3000
+npm run db:up | db:migrate | db:verify | db:reset -- --yes   # local PostgreSQL helpers
 npm run dev:backend                   # API on :8080 (needs backend/.env); Docker if no Rust
 cd frontend && npm run dev            # proxies /api -> http://localhost:8080
 ```
 Rust may not be installed on the host. `node scripts/cargo.mjs <args>` (which the root npm scripts use)
-falls back to running cargo in the `rust:1-bookworm` Docker image, e.g. `node scripts/cargo.mjs test --test api`.
+falls back to running cargo in the `rust:1-bookworm` Docker image, e.g. `node scripts/cargo.mjs test --lib`.
 
 ## Conventions and gotchas
-- **SQL is SQLite/libSQL**, sent through `db::query_*` / `db::execute` with numbered placeholders
-  (`?1`, `?2`, and the same number can repeat) and values from `args![...]`. Never format user
-  input into SQL. Table names in `backup.rs` come from a constant list only.
-- **Storage formats** (enforced by `CHECK`s in STRICT tables): UUIDs are hyphenated lower-case
-  text, booleans are 0/1, dates are `YYYY-MM-DD` text (which compares correctly), timestamps are
-  RFC 3339 UTC with milliseconds. Set `created_at`/`updated_at` from Rust with `db::now_ts()`;
-  don't use SQL `now()` or `CURRENT_TIMESTAMP` (wrong format).
+- **SQL is PostgreSQL**, sent through `db::query_*` / `db::execute` with `$1`, `$2` placeholders
+  (a number can repeat) and values from `args![...]`, passing `&mut conn` or `&mut tx`. Never format
+  user input into SQL. Table names in `verify.rs` come from a constant list only.
+- Bind values with the column's Rust type (`Uuid`, `NaiveDate`, `bool`, `i32` for `minutes`, `i64`).
+  Binding a `&str` to a `uuid` or `date` column is a type error in PostgreSQL.
+- **Types:** `UUID` ids (generated in Rust), `BOOLEAN`, `DATE`, `TIMESTAMPTZ`. Set
+  `created_at`/`updated_at` from Rust with `db::now_ts()` (microsecond precision), so responses
+  match what is stored.
 - Map rows by implementing `FromRecord` (in `models.rs`) and using `r.text/opt_text/i64/bool/uuid/date/ts("col")`.
-  `SUM()`/`COUNT()` come back as integers. Use `COALESCE(SUM(x), 0)`.
-- **Don't rely on `PRAGMA foreign_keys` or `ON DELETE CASCADE`** for correctness. Over Turso's
-  HTTPS protocol the pragma isn't guaranteed per request. Delete children explicitly in a
-  `write_tx` (see `delete_user` / `delete_project`) and check referenced rows exist before
-  inserting (see `add_members`). Local connections enable foreign keys as a safety net.
-- Read-check-write logic (like the daily cap) must run inside `db::write_tx` so it is atomic.
+  `COUNT()` and `SUM(int)` return BIGINT; `r.i64` also accepts INT4. Use `COALESCE(SUM(x), 0)`, and
+  `COUNT(*) FILTER (WHERE flag)` instead of summing booleans.
+- Foreign keys cascade in the schema, and `delete_user` / `delete_project` also delete children
+  explicitly in one `write_tx`. Keep both.
+- Read-check-write logic (like the daily cap) must run inside `db::write_tx` **and** call
+  `db::lock_user` first. PostgreSQL's default isolation (READ COMMITTED) doesn't prevent the race
+  on its own: `daily_cap_holds_under_concurrent_requests` fails without the lock.
 - Durations are stored as **integer minutes** (`time_entries.minutes`, 1–1440). The UI collects
   hours and minutes and sends `minutes`. The API also caps a user's total per day at 24h.
 - Business rules live in the backend, not only the UI:
@@ -76,19 +88,25 @@ falls back to running cargo in the `rust:1-bookworm` Docker image, e.g. `node sc
   - users can't change their own email (only `PATCH /api/admin/users/{id}` can)
   - admins can't demote, deactivate or delete themselves
 - Removing a project member keeps their entries. Deleting a project or user deletes their entries.
-- Emails are stored lower-cased. Normalize them before lookups and inserts.
+- Emails are stored lower-cased (a `CHECK` enforces it). Normalize them before lookups and inserts.
 - **Sessions:** cookies only (`hw_session` HttpOnly + `hw_csrf`). Bump `users.session_epoch` to
   revoke sessions (password change/reset, deactivation). Don't add Bearer-token auth or put
   tokens in localStorage.
 - Errors: return `AppError`. It serializes to `{"error": "..."}` and the frontend shows `error`.
-  `libsql` errors are mapped in `error.rs` (constraint → 400/409, connection → 503).
-- Adding a schema change means adding a **new** `migrations/000N_description.sql` **and** appending
-  it to `MIGRATIONS` in `src/migrate.rs`. Never edit an applied migration (the checksum check fails).
-  If a column is added to a table, `backup.rs` picks it up automatically via `pragma_table_info`.
-- Secrets (`TURSO_AUTH_TOKEN`, `JWT_SECRET`) come only from the environment. Never log or commit
-  them; `DbTarget::describe()` is the only thing logged about the database.
-- Tests must use isolated data: `TestApp::new()` in backend tests, mocked `api` in Vitest, the e2e
-  stack for Playwright. Never point tests at a real database. `turso_cloud.rs` refuses non-empty databases.
+  `sqlx` errors are mapped in `error.rs` by SQLSTATE (23505 → 409; 23503/23514/23502 → 400;
+  timeouts, connection and pool errors → 503).
+- A schema change is a **new** `migrations/000N_description.sql` (picked up by `sqlx::migrate!`;
+  `build.rs` re-embeds on change). Never edit an applied migration, because the checksum check fails.
+- Secrets (the password in `DATABASE_URL`, `JWT_SECRET`, `ADMIN_PASSWORD`) come only from the
+  environment. Never log or commit them. `DbSettings::describe()` (`user@host:port/db`) is the only
+  thing logged about the database, and `Config`'s Debug output redacts secrets.
+- Tests must use isolated data: `TestApp::new()` in backend tests (its own database on the
+  disposable server), mocked `api` in Vitest, and the e2e stack for Playwright. Never point tests at a
+  real database. The harness only uses `HOURWISE_TEST_DATABASE_URL`, refuses servers that match a
+  protected `DATABASE_URL`, requires `hourwise.disposable=on`, and drops only its own databases.
+- Health: `/api/health` (liveness, no DB) and `/api/health/ready` (DB ping); the frontend has
+  `/healthz`. In production only the frontend is public; it proxies to the backend's private name
+  (`BACKEND_URL`, baked in at build time).
 - Next.js `rewrites` are resolved at **build time**, so `BACKEND_URL` must be set during `next build`.
 - With Next 16, use `useParams()` in client pages rather than the `params` prop.
 - **Data fetching:** use `useApiData(path, query)` from `src/lib/hooks.ts`. Don't use `useEffect` +

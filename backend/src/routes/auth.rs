@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     args,
-    auth::{clear_cookies, session_cookies, verify_password, DUMMY_HASH},
+    auth::{clear_cookies, session_cookies, DUMMY_HASH},
+    client_ip::ClientIp,
     db,
     error::{AppError, AppResult},
     models::User,
@@ -34,35 +35,46 @@ pub fn session_headers(user: &User, state: &AppState) -> AppResult<HeaderMap> {
     Ok(headers)
 }
 
-/// Verifies credentials and starts a cookie session. Failed attempts are rate limited per email.
+/// Verifies credentials and starts a cookie session. Failed attempts are rate limited per
+/// email+client IP and per client IP (see `auth::LoginLimiter`), and the password check itself
+/// goes through the hashing concurrency limit.
 pub async fn login(
     State(state): State<AppState>,
+    ClientIp(ip): ClientIp,
     Json(body): Json<LoginRequest>,
 ) -> AppResult<(HeaderMap, Json<LoginResponse>)> {
     let email = body.email.trim().to_lowercase();
     if email.is_empty() || email.len() > 320 {
         return Err(AppError::Unauthorized);
     }
-    state
+    // Reserved before any work; refunded automatically if we return early with an error.
+    let attempt = state
         .login_limiter
-        .check(&email)
+        .begin(&email, ip)
         .map_err(AppError::TooManyRequests)?;
 
-    let conn = state.db.conn().await?;
-    let user: Option<User> =
-        db::query_opt(&conn, "SELECT * FROM users WHERE email = ?1", args![&email]).await?;
+    let user: Option<User> = {
+        // Return the connection to the pool before waiting for a hashing slot.
+        let mut conn = state.db.conn().await?;
+        db::query_opt(
+            &mut conn,
+            "SELECT * FROM users WHERE email = $1",
+            args![&email],
+        )
+        .await?
+    };
 
     // Always run one Argon2 verification so unknown emails take as long as wrong passwords.
     let hash = user
         .as_ref()
         .map_or_else(|| DUMMY_HASH.to_string(), |u| u.password_hash.clone());
-    let password_ok = verify_password(body.password, hash).await;
+    let password_ok = state.hashing.verify(body.password, hash).await?;
 
     let Some(user) = user.filter(|_| password_ok) else {
-        state.login_limiter.record_failure(&email);
+        attempt.failed();
         return Err(AppError::Unauthorized);
     };
-    state.login_limiter.reset(&email);
+    attempt.succeeded();
     if !user.is_active {
         return Err(AppError::BadRequest(
             "Your account has been deactivated. Contact an administrator.".into(),

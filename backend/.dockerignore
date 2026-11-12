@@ -1,6 +1,5 @@
 target
 uploads
 .env
+.env.*
 data
-*.db
-*.db-*

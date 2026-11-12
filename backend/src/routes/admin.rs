@@ -1,3 +1,4 @@
+use crate::db::Connection;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -5,13 +6,12 @@ use axum::{
     Json, Router,
 };
 use chrono::{Datelike, Duration, NaiveDate, Utc};
-use libsql::Connection;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
     args,
-    auth::{hash_password, validate_password, AdminUser},
+    auth::{validate_password, AdminUser},
     db,
     error::{AppError, AppResult},
     models::{
@@ -49,8 +49,10 @@ fn email_conflict(e: AppError) -> AppError {
     }
 }
 
-async fn exists(conn: &Connection, sql: &str, id: Uuid) -> AppResult<bool> {
-    Ok(db::query_value(conn, sql, args![id]).await?.is_some())
+async fn exists(conn: &mut Connection, sql: &str, id: Uuid) -> AppResult<bool> {
+    Ok(db::query_scalar::<i32>(conn, sql, args![id])
+        .await?
+        .is_some())
 }
 
 // ---------------------------------------------------------------- stats
@@ -76,27 +78,27 @@ pub fn period_starts(today: NaiveDate) -> (NaiveDate, NaiveDate) {
 async fn stats(State(state): State<AppState>, _admin: AdminUser) -> AppResult<Json<Stats>> {
     let today = Utc::now().date_naive();
     let (week_start, month_start) = period_starts(today);
-    let conn = state.db.conn().await?;
+    let mut conn = state.db.conn().await?;
 
     let users = db::query_records(
-        &conn,
-        "SELECT COUNT(*) AS total, COALESCE(SUM(is_active), 0) AS active FROM users",
+        &mut conn,
+        "SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE is_active) AS active FROM users",
         args![],
     )
     .await?;
     let projects = db::query_records(
-        &conn,
-        "SELECT COUNT(*) AS total, COALESCE(SUM(1 - is_archived), 0) AS active FROM projects",
+        &mut conn,
+        "SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE NOT is_archived) AS active FROM projects",
         args![],
     )
     .await?;
     let minutes = db::query_records(
-        &conn,
+        &mut conn,
         "SELECT
-            COALESCE(SUM(CASE WHEN entry_date = ?1 THEN minutes END), 0) AS today,
-            COALESCE(SUM(CASE WHEN entry_date >= ?2 THEN minutes END), 0) AS week,
-            COALESCE(SUM(CASE WHEN entry_date >= ?3 THEN minutes END), 0) AS month
-         FROM time_entries WHERE entry_date >= ?4 AND entry_date <= ?1",
+            COALESCE(SUM(CASE WHEN entry_date = $1 THEN minutes END), 0) AS today,
+            COALESCE(SUM(CASE WHEN entry_date >= $2 THEN minutes END), 0) AS week,
+            COALESCE(SUM(CASE WHEN entry_date >= $3 THEN minutes END), 0) AS month
+         FROM time_entries WHERE entry_date >= $4 AND entry_date <= $1",
         args![today, week_start, month_start, week_start.min(month_start)],
     )
     .await?;
@@ -130,9 +132,9 @@ async fn list_users(
     State(state): State<AppState>,
     _admin: AdminUser,
 ) -> AppResult<Json<Vec<UserWithStats>>> {
-    let conn = state.db.conn().await?;
+    let mut conn = state.db.conn().await?;
     let sql = format!("{USER_STATS_SELECT} ORDER BY u.is_active DESC, lower(u.name)");
-    Ok(Json(db::query_all(&conn, &sql, args![]).await?))
+    Ok(Json(db::query_all(&mut conn, &sql, args![]).await?))
 }
 
 pub fn validate_role(role: &str) -> AppResult<()> {
@@ -182,15 +184,15 @@ async fn create_user(
     let role = body.role.unwrap_or_else(|| ROLE_MEMBER.into());
     validate_role(&role)?;
     validate_password(&body.password)?;
-    let hash = hash_password(body.password).await?;
+    let hash = state.hashing.hash(body.password).await?;
     let now = db::now_ts();
 
-    let conn = state.db.conn().await?;
-    let tx = db::write_tx(&conn).await?;
+    let mut conn = state.db.conn().await?;
+    let mut tx = db::write_tx(&mut conn).await?;
     let user: User = db::query_one(
-        &tx,
+        &mut tx,
         "INSERT INTO users (id, email, name, password_hash, role, job_title, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) RETURNING *",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $7) RETURNING *",
         args![
             Uuid::new_v4(),
             &email,
@@ -204,12 +206,12 @@ async fn create_user(
     .await
     .map_err(email_conflict)?;
     for project_id in body.project_ids {
-        if !exists(&tx, "SELECT 1 FROM projects WHERE id = ?1", project_id).await? {
+        if !exists(&mut tx, "SELECT 1 FROM projects WHERE id = $1", project_id).await? {
             return Err(AppError::bad("Referenced record does not exist"));
         }
         db::execute(
-            &tx,
-            "INSERT INTO project_members (project_id, user_id, added_at) VALUES (?1, ?2, ?3)
+            &mut tx,
+            "INSERT INTO project_members (project_id, user_id, added_at) VALUES ($1, $2, $3)
              ON CONFLICT DO NOTHING",
             args![project_id, user.id, &now],
         )
@@ -230,20 +232,20 @@ async fn get_user(
     _admin: AdminUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<UserDetail>> {
-    let conn = state.db.conn().await?;
-    let sql = format!("{USER_STATS_SELECT} WHERE u.id = ?1");
-    let user: UserWithStats = db::query_opt(&conn, &sql, args![id])
+    let mut conn = state.db.conn().await?;
+    let sql = format!("{USER_STATS_SELECT} WHERE u.id = $1");
+    let user: UserWithStats = db::query_opt(&mut conn, &sql, args![id])
         .await?
         .ok_or_else(|| AppError::not_found("User"))?;
 
     let projects = db::query_all(
-        &conn,
+        &mut conn,
         "SELECT p.*, pm.added_at,
             (SELECT COALESCE(SUM(te.minutes), 0) FROM time_entries te
-              WHERE te.project_id = p.id AND te.user_id = ?1) AS total_minutes
+              WHERE te.project_id = p.id AND te.user_id = $1) AS total_minutes
          FROM project_members pm
          JOIN projects p ON p.id = pm.project_id
-         WHERE pm.user_id = ?1
+         WHERE pm.user_id = $1
          ORDER BY p.is_archived, lower(p.name)",
         args![id],
     )
@@ -269,8 +271,8 @@ async fn update_user(
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateUser>,
 ) -> AppResult<Json<User>> {
-    let conn = state.db.conn().await?;
-    let existing: User = db::query_opt(&conn, "SELECT * FROM users WHERE id = ?1", args![id])
+    let mut conn = state.db.conn().await?;
+    let existing: User = db::query_opt(&mut conn, "SELECT * FROM users WHERE id = $1", args![id])
         .await?
         .ok_or_else(|| AppError::not_found("User"))?;
 
@@ -300,7 +302,7 @@ async fn update_user(
     let password_hash = match body.password {
         Some(p) if !p.is_empty() => {
             validate_password(&p)?;
-            hash_password(p).await?
+            state.hashing.hash(p).await?
         }
         _ => existing.password_hash.clone(),
     };
@@ -309,11 +311,11 @@ async fn update_user(
     let session_epoch = existing.session_epoch + i64::from(revoke);
 
     let updated = db::query_one(
-        &conn,
+        &mut conn,
         "UPDATE users
-         SET email = ?2, name = ?3, role = ?4, is_active = ?5, job_title = ?6,
-             password_hash = ?7, updated_at = ?8, session_epoch = ?9
-         WHERE id = ?1 RETURNING *",
+         SET email = $2, name = $3, role = $4, is_active = $5, job_title = $6,
+             password_hash = $7, updated_at = $8, session_epoch = $9
+         WHERE id = $1 RETURNING *",
         args![
             id,
             email,
@@ -331,9 +333,8 @@ async fn update_user(
     Ok(Json(updated))
 }
 
-/// Deletes a user and everything that belongs to them. The cascade is done explicitly (not via
-/// `ON DELETE CASCADE`) so it behaves the same on Turso Cloud, where the app does not depend on
-/// `PRAGMA foreign_keys` being enabled for the connection.
+/// Deletes a user and everything that belongs to them, in one transaction. The foreign keys
+/// also cascade; deleting the children explicitly keeps the behaviour obvious from the code.
 async fn delete_user(
     State(state): State<AppState>,
     AdminUser(admin): AdminUser,
@@ -342,21 +343,21 @@ async fn delete_user(
     if admin.id == id {
         return Err(AppError::bad("You cannot delete your own account"));
     }
-    let conn = state.db.conn().await?;
-    let tx = db::write_tx(&conn).await?;
+    let mut conn = state.db.conn().await?;
+    let mut tx = db::write_tx(&mut conn).await?;
     db::execute(
-        &tx,
-        "DELETE FROM time_entries WHERE user_id = ?1",
+        &mut tx,
+        "DELETE FROM time_entries WHERE user_id = $1",
         args![id],
     )
     .await?;
     db::execute(
-        &tx,
-        "DELETE FROM project_members WHERE user_id = ?1",
+        &mut tx,
+        "DELETE FROM project_members WHERE user_id = $1",
         args![id],
     )
     .await?;
-    let affected = db::execute(&tx, "DELETE FROM users WHERE id = ?1", args![id]).await?;
+    let affected = db::execute(&mut tx, "DELETE FROM users WHERE id = $1", args![id]).await?;
     if affected == 0 {
         return Err(AppError::not_found("User"));
     }
@@ -377,9 +378,9 @@ async fn list_projects(
     State(state): State<AppState>,
     _admin: AdminUser,
 ) -> AppResult<Json<Vec<ProjectSummary>>> {
-    let conn = state.db.conn().await?;
+    let mut conn = state.db.conn().await?;
     let sql = format!("{PROJECT_SUMMARY_SELECT} ORDER BY p.is_archived, lower(p.name)");
-    Ok(Json(db::query_all(&conn, &sql, args![]).await?))
+    Ok(Json(db::query_all(&mut conn, &sql, args![]).await?))
 }
 
 #[derive(Deserialize)]
@@ -416,11 +417,11 @@ async fn create_project(
 ) -> AppResult<(StatusCode, Json<Project>)> {
     let name = validate_project_name(body.name.as_deref().unwrap_or(""))?;
     let color = validate_project_color(body.color, "#f36c00")?;
-    let conn = state.db.conn().await?;
+    let mut conn = state.db.conn().await?;
     let project = db::query_one(
-        &conn,
+        &mut conn,
         "INSERT INTO projects (id, name, client, description, color, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6) RETURNING *",
+         VALUES ($1, $2, $3, $4, $5, $6, $6) RETURNING *",
         args![
             Uuid::new_v4(),
             name,
@@ -445,20 +446,20 @@ async fn get_project(
     _admin: AdminUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<ProjectDetail>> {
-    let conn = state.db.conn().await?;
-    let sql = format!("{PROJECT_SUMMARY_SELECT} WHERE p.id = ?1");
-    let project: ProjectSummary = db::query_opt(&conn, &sql, args![id])
+    let mut conn = state.db.conn().await?;
+    let sql = format!("{PROJECT_SUMMARY_SELECT} WHERE p.id = $1");
+    let project: ProjectSummary = db::query_opt(&mut conn, &sql, args![id])
         .await?
         .ok_or_else(|| AppError::not_found("Project"))?;
 
     let members = db::query_all(
-        &conn,
+        &mut conn,
         "SELECT u.id, u.name, u.email, u.avatar_url, u.role, u.job_title, u.is_active, pm.added_at,
             (SELECT COALESCE(SUM(te.minutes), 0) FROM time_entries te
-              WHERE te.user_id = u.id AND te.project_id = ?1) AS total_minutes
+              WHERE te.user_id = u.id AND te.project_id = $1) AS total_minutes
          FROM project_members pm
          JOIN users u ON u.id = pm.user_id
-         WHERE pm.project_id = ?1
+         WHERE pm.project_id = $1
          ORDER BY lower(u.name)",
         args![id],
     )
@@ -473,10 +474,11 @@ async fn update_project(
     Path(id): Path<Uuid>,
     Json(body): Json<ProjectInput>,
 ) -> AppResult<Json<Project>> {
-    let conn = state.db.conn().await?;
-    let existing: Project = db::query_opt(&conn, "SELECT * FROM projects WHERE id = ?1", args![id])
-        .await?
-        .ok_or_else(|| AppError::not_found("Project"))?;
+    let mut conn = state.db.conn().await?;
+    let existing: Project =
+        db::query_opt(&mut conn, "SELECT * FROM projects WHERE id = $1", args![id])
+            .await?
+            .ok_or_else(|| AppError::not_found("Project"))?;
 
     let name = match body.name {
         Some(n) => validate_project_name(&n)?,
@@ -494,10 +496,10 @@ async fn update_project(
     let is_archived = body.is_archived.unwrap_or(existing.is_archived);
 
     let project = db::query_one(
-        &conn,
+        &mut conn,
         "UPDATE projects
-         SET name = ?2, client = ?3, description = ?4, color = ?5, is_archived = ?6, updated_at = ?7
-         WHERE id = ?1 RETURNING *",
+         SET name = $2, client = $3, description = $4, color = $5, is_archived = $6, updated_at = $7
+         WHERE id = $1 RETURNING *",
         args![
             id,
             name,
@@ -519,21 +521,21 @@ async fn delete_project(
     _admin: AdminUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<StatusCode> {
-    let conn = state.db.conn().await?;
-    let tx = db::write_tx(&conn).await?;
+    let mut conn = state.db.conn().await?;
+    let mut tx = db::write_tx(&mut conn).await?;
     db::execute(
-        &tx,
-        "DELETE FROM time_entries WHERE project_id = ?1",
+        &mut tx,
+        "DELETE FROM time_entries WHERE project_id = $1",
         args![id],
     )
     .await?;
     db::execute(
-        &tx,
-        "DELETE FROM project_members WHERE project_id = ?1",
+        &mut tx,
+        "DELETE FROM project_members WHERE project_id = $1",
         args![id],
     )
     .await?;
-    let affected = db::execute(&tx, "DELETE FROM projects WHERE id = ?1", args![id]).await?;
+    let affected = db::execute(&mut tx, "DELETE FROM projects WHERE id = $1", args![id]).await?;
     if affected == 0 {
         return Err(AppError::not_found("Project"));
     }
@@ -552,19 +554,19 @@ async fn add_members(
     Path(id): Path<Uuid>,
     Json(body): Json<AddMembers>,
 ) -> AppResult<StatusCode> {
-    let conn = state.db.conn().await?;
-    if !exists(&conn, "SELECT 1 FROM projects WHERE id = ?1", id).await? {
+    let mut conn = state.db.conn().await?;
+    if !exists(&mut conn, "SELECT 1 FROM projects WHERE id = $1", id).await? {
         return Err(AppError::not_found("Project"));
     }
     let now = db::now_ts();
-    let tx = db::write_tx(&conn).await?;
+    let mut tx = db::write_tx(&mut conn).await?;
     for user_id in body.user_ids {
-        if !exists(&tx, "SELECT 1 FROM users WHERE id = ?1", user_id).await? {
+        if !exists(&mut tx, "SELECT 1 FROM users WHERE id = $1", user_id).await? {
             return Err(AppError::bad("Referenced record does not exist"));
         }
         db::execute(
-            &tx,
-            "INSERT INTO project_members (project_id, user_id, added_at) VALUES (?1, ?2, ?3)
+            &mut tx,
+            "INSERT INTO project_members (project_id, user_id, added_at) VALUES ($1, $2, $3)
              ON CONFLICT DO NOTHING",
             args![id, user_id, &now],
         )
@@ -580,10 +582,10 @@ async fn remove_member(
     _admin: AdminUser,
     Path((id, user_id)): Path<(Uuid, Uuid)>,
 ) -> AppResult<StatusCode> {
-    let conn = state.db.conn().await?;
+    let mut conn = state.db.conn().await?;
     db::execute(
-        &conn,
-        "DELETE FROM project_members WHERE project_id = ?1 AND user_id = ?2",
+        &mut conn,
+        "DELETE FROM project_members WHERE project_id = $1 AND user_id = $2",
         args![id, user_id],
     )
     .await?;
@@ -608,13 +610,13 @@ async fn list_entries(
     let (from, to) = date_range(q.from, q.to)?;
     let sql = format!(
         "{ENTRY_SELECT}
-         WHERE te.entry_date BETWEEN ?1 AND ?2
-           AND (?3 IS NULL OR te.project_id = ?3)
-           AND (?4 IS NULL OR te.user_id = ?4)
+         WHERE te.entry_date BETWEEN $1 AND $2
+           AND ($3 IS NULL OR te.project_id = $3)
+           AND ($4 IS NULL OR te.user_id = $4)
          ORDER BY te.entry_date DESC, lower(u.name), te.created_at DESC"
     );
-    let conn = state.db.conn().await?;
-    let entries = db::query_all(&conn, &sql, args![from, to, q.project_id, q.user_id]).await?;
+    let mut conn = state.db.conn().await?;
+    let entries = db::query_all(&mut conn, &sql, args![from, to, q.project_id, q.user_id]).await?;
     Ok(Json(entries))
 }
 

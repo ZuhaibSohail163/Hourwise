@@ -7,12 +7,12 @@ pub async fn my_projects(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
 ) -> AppResult<Json<Vec<Project>>> {
-    let conn = state.db.conn().await?;
+    let mut conn = state.db.conn().await?;
     let projects = db::query_all(
-        &conn,
+        &mut conn,
         "SELECT p.* FROM projects p
          JOIN project_members pm ON pm.project_id = p.id
-         WHERE pm.user_id = ?1
+         WHERE pm.user_id = $1
          ORDER BY p.is_archived, lower(p.name)",
         args![user.id],
     )

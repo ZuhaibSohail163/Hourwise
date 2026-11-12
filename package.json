@@ -1,7 +1,7 @@
 {
   "name": "hourwise",
   "private": true,
-  "description": "Repo-level lint/format commands for the Rust backend and Next.js frontend. No dependencies.",
+  "description": "Repo-level scripts: lint/format, tests, local database and backups. No dependencies.",
   "scripts": {
     "lint": "npm run lint:backend && npm run lint:frontend",
     "lint:backend": "node scripts/cargo.mjs clippy --all-targets -- -D warnings",
@@ -13,15 +13,20 @@
     "format:check": "node scripts/cargo.mjs fmt --check && npm --prefix frontend run format:check",
     "check": "npm run format:check && npm run lint && npm --prefix frontend run typecheck",
     "test": "npm run test:backend && npm run test:frontend",
-    "test:backend": "node scripts/cargo.mjs test",
+    "test:backend": "node scripts/test-backend.mjs",
     "test:unit": "node scripts/cargo.mjs test --lib",
-    "test:integration": "node scripts/cargo.mjs test --tests --test api --test db --test security",
-    "test:turso": "node scripts/cargo.mjs test --test turso_cloud -- --ignored --nocapture",
+    "test:integration": "node scripts/test-backend.mjs --test api --test db --test security",
     "test:frontend": "npm --prefix frontend test",
     "test:e2e": "node scripts/e2e.mjs",
     "test:all": "npm test && npm run test:e2e",
     "backup": "node scripts/backup.mjs",
     "dev:backend": "node scripts/cargo.mjs run",
-    "dev:frontend": "npm --prefix frontend run dev"
+    "dev:frontend": "npm --prefix frontend run dev",
+    "db:up": "docker compose up -d --wait db",
+    "db:down": "docker compose stop db",
+    "db:logs": "docker compose logs -f db",
+    "db:migrate": "docker compose run --rm backend hourwise-backend migrate",
+    "db:verify": "docker compose run --rm backend hourwise-backend verify",
+    "db:reset": "node scripts/db-reset.mjs"
   }
 }

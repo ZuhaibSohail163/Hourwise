@@ -21,6 +21,9 @@ pub enum AppError {
     TooManyRequests(u64),
     #[error("The database is temporarily unavailable. Please try again.")]
     Unavailable(String),
+    /// Too many password checks are already running (see `auth::HashLimiter`).
+    #[error("The server is busy. Please try again in a moment.")]
+    Busy,
     #[error("Internal server error")]
     Internal(String),
 }
@@ -43,55 +46,46 @@ impl AppError {
     }
 }
 
-/// Maps a database error message to an [`AppError`]. SQLite reports constraint failures with
-/// the same wording locally and through Turso Cloud, so matching on the message works for both.
-pub fn classify_db_error(message: &str) -> AppError {
-    let m = message.to_ascii_lowercase();
-    if m.contains("unique constraint failed") || m.contains("sqlite_constraint_primarykey") {
-        return AppError::Conflict("A record with that value already exists".into());
+/// Maps a PostgreSQL SQLSTATE code (see the PostgreSQL "Error Codes" appendix) to an
+/// [`AppError`]. `detail` is only used for logs.
+pub fn classify_sql_state(code: &str, detail: &str) -> AppError {
+    match code {
+        // unique_violation
+        "23505" => AppError::Conflict("A record with that value already exists".into()),
+        // foreign_key_violation
+        "23503" => AppError::BadRequest("Referenced record does not exist".into()),
+        // check_violation, not_null_violation, numeric_value_out_of_range,
+        // string_data_right_truncation, invalid_datetime_format, datetime_field_overflow
+        "23514" | "23502" | "22003" | "22001" | "22007" | "22008" => {
+            AppError::BadRequest("Value is out of the allowed range".into())
+        }
+        // serialization_failure, deadlock_detected, lock_not_available, query_canceled
+        // (statement_timeout), too_many_connections, cannot_connect_now, admin_shutdown,
+        // crash_shutdown
+        "40001" | "40P01" | "55P03" | "57014" | "53300" | "57P03" | "57P01" | "57P02" => {
+            AppError::Unavailable(format!("{code}: {detail}"))
+        }
+        // Class 08: connection exceptions
+        c if c.starts_with("08") => AppError::Unavailable(format!("{code}: {detail}")),
+        _ => AppError::Internal(format!("{code}: {detail}")),
     }
-    if m.contains("foreign key constraint failed") {
-        return AppError::BadRequest("Referenced record does not exist".into());
-    }
-    if m.contains("check constraint failed") || m.contains("not null constraint failed") {
-        return AppError::BadRequest("Value is out of the allowed range".into());
-    }
-    if m.contains("database is locked") || m.contains("sqlite_busy") {
-        return AppError::Unavailable(message.to_string());
-    }
-    AppError::Internal(message.to_string())
 }
 
-impl From<libsql::Error> for AppError {
-    fn from(e: libsql::Error) -> Self {
+impl From<sqlx::Error> for AppError {
+    fn from(e: sqlx::Error) -> Self {
         match &e {
-            libsql::Error::ConnectionFailed(_) => AppError::Unavailable(e.to_string()),
-            libsql::Error::QueryReturnedNoRows => AppError::NotFound("Not found".into()),
-            libsql::Error::Hrana(inner) => {
-                let msg = inner.to_string();
-                let lower = msg.to_ascii_lowercase();
-                // Network / auth failures talking to Turso Cloud become 503s; SQL errors
-                // (constraint violations etc.) are classified like local SQLite errors.
-                let is_sql_error = lower.contains("constraint") || lower.contains("sqlite");
-                let is_transport_error = [
-                    "error trying to connect",
-                    "connection refused",
-                    "timed out",
-                    "dns",
-                    "unauthorized",
-                    "status=401",
-                    "status=403",
-                    "status=5",
-                    "stream expired",
-                ]
-                .iter()
-                .any(|needle| lower.contains(needle));
-                if is_transport_error && !is_sql_error {
-                    return AppError::Unavailable(msg);
-                }
-                classify_db_error(&msg)
+            sqlx::Error::RowNotFound => AppError::NotFound("Not found".into()),
+            sqlx::Error::Database(db) => {
+                classify_sql_state(db.code().as_deref().unwrap_or(""), db.message())
             }
-            _ => classify_db_error(&e.to_string()),
+            // Pool exhausted, PostgreSQL down or restarting, network or TLS failures.
+            sqlx::Error::PoolTimedOut
+            | sqlx::Error::PoolClosed
+            | sqlx::Error::Io(_)
+            | sqlx::Error::Tls(_)
+            | sqlx::Error::Protocol(_)
+            | sqlx::Error::WorkerCrashed => AppError::Unavailable(e.to_string()),
+            _ => AppError::Internal(e.to_string()),
         }
     }
 }
@@ -109,16 +103,20 @@ impl IntoResponse for AppError {
                 tracing::error!("database unavailable: {detail}");
                 StatusCode::SERVICE_UNAVAILABLE
             }
+            AppError::Busy => StatusCode::SERVICE_UNAVAILABLE,
             AppError::Internal(detail) => {
                 tracing::error!("internal error: {detail}");
                 StatusCode::INTERNAL_SERVER_ERROR
             }
         };
         let mut res = (status, Json(json!({ "error": self.to_string() }))).into_response();
-        if let AppError::TooManyRequests(secs) = &self {
-            if let Ok(v) = secs.to_string().parse() {
-                res.headers_mut().insert(RETRY_AFTER, v);
-            }
+        let retry_after = match &self {
+            AppError::TooManyRequests(secs) => Some(*secs),
+            AppError::Busy => Some(2),
+            _ => None,
+        };
+        if let Some(Ok(v)) = retry_after.map(|s| s.to_string().parse()) {
+            res.headers_mut().insert(RETRY_AFTER, v);
         }
         res
     }
@@ -129,26 +127,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classifies_constraint_messages() {
+    fn classifies_postgres_error_codes() {
         assert!(matches!(
-            classify_db_error("SQLite failure: `UNIQUE constraint failed: users.email`"),
+            classify_sql_state("23505", "duplicate key value violates unique constraint"),
             AppError::Conflict(_)
         ));
         assert!(matches!(
-            classify_db_error("FOREIGN KEY constraint failed"),
+            classify_sql_state("23503", "violates foreign key constraint"),
             AppError::BadRequest(_)
         ));
         assert!(matches!(
-            classify_db_error("CHECK constraint failed: minutes > 0"),
+            classify_sql_state("23514", "violates check constraint"),
             AppError::BadRequest(_)
         ));
         assert!(matches!(
-            classify_db_error("database is locked"),
+            classify_sql_state("23502", "null value in column"),
+            AppError::BadRequest(_)
+        ));
+        assert!(matches!(
+            classify_sql_state("57014", "canceling statement due to statement timeout"),
             AppError::Unavailable(_)
         ));
         assert!(matches!(
-            classify_db_error("no such table: foo"),
+            classify_sql_state("08006", "connection failure"),
+            AppError::Unavailable(_)
+        ));
+        assert!(matches!(
+            classify_sql_state("42P01", "relation does not exist"),
             AppError::Internal(_)
+        ));
+        assert!(matches!(
+            AppError::from(sqlx::Error::PoolTimedOut),
+            AppError::Unavailable(_)
+        ));
+        assert!(matches!(
+            AppError::from(sqlx::Error::RowNotFound),
+            AppError::NotFound(_)
         ));
     }
 

@@ -8,10 +8,13 @@ use axum::{
     http::{header, Method, Request, StatusCode},
 };
 use common::*;
+use std::{sync::Arc, time::Duration};
+
 use hourwise_backend::{
     args,
-    auth::create_token,
-    db::{self, Db, DbTarget},
+    auth::{create_token, HashLimiter},
+    client_ip::parse_trusted_proxies,
+    db::{self, Db, DbSettings},
     models::User,
 };
 use serde_json::json;
@@ -118,8 +121,8 @@ async fn invalid_tampered_and_forged_sessions_are_rejected() {
     );
 
     // A token signed with another secret (e.g. forged admin claims).
-    let conn = app.state.db.conn().await.unwrap();
-    let user: User = db::query_one(&conn, "SELECT * FROM users LIMIT 1", args![])
+    let mut conn = app.conn().await;
+    let user: User = db::query_one(&mut conn, "SELECT * FROM users LIMIT 1", args![])
         .await
         .unwrap();
     let forged = create_token(&user, "c", "some-other-secret-some-other-secret!!", 1).unwrap();
@@ -149,8 +152,8 @@ async fn invalid_tampered_and_forged_sessions_are_rejected() {
 async fn expired_sessions_are_rejected() {
     let app = TestApp::new().await;
     app.admin().await;
-    let conn = app.state.db.conn().await.unwrap();
-    let user: User = db::query_one(&conn, "SELECT * FROM users LIMIT 1", args![])
+    let mut conn = app.conn().await;
+    let user: User = db::query_one(&mut conn, "SELECT * FROM users LIMIT 1", args![])
         .await
         .unwrap();
     let expired = create_token(&user, "c", JWT_SECRET, -1).unwrap();
@@ -601,28 +604,194 @@ async fn successful_login_resets_the_failure_counter() {
     }
 }
 
+const ATTACKER: &str = "198.51.100.1";
+const VICTIM: &str = "203.0.113.5";
+
+#[tokio::test]
+async fn failed_logins_lock_the_email_only_for_the_failing_address() {
+    let app = TestApp::with(|c| c.login_max_attempts = 3).await;
+    for _ in 0..3 {
+        let res = app
+            .try_login_from(ADMIN_EMAIL, "wrong", ATTACKER, None)
+            .await;
+        assert_eq!(res.status, StatusCode::UNAUTHORIZED);
+    }
+    let locked = app
+        .try_login_from(ADMIN_EMAIL, "wrong", ATTACKER, None)
+        .await;
+    assert_eq!(locked.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        app.try_login_from(ADMIN_EMAIL, ADMIN_PASSWORD, ATTACKER, None)
+            .await
+            .status,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // The real user, signing in from their own address, is not locked out.
+    assert_eq!(
+        app.try_login_from(ADMIN_EMAIL, ADMIN_PASSWORD, VICTIM, None)
+            .await
+            .status,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn password_spraying_from_one_address_is_blocked() {
+    let app = TestApp::with(|c| c.login_max_attempts_per_ip = 5).await;
+    for i in 0..5 {
+        let res = app
+            .try_login_from(&format!("user{i}@test.local"), "Summer2026", ATTACKER, None)
+            .await;
+        assert_eq!(res.status, StatusCode::UNAUTHORIZED);
+    }
+    let blocked = app
+        .try_login_from("user99@test.local", "Summer2026", ATTACKER, None)
+        .await;
+    assert_eq!(blocked.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(blocked.headers.get(header::RETRY_AFTER).is_some());
+    // Other addresses are unaffected.
+    assert_eq!(
+        app.try_login_from(ADMIN_EMAIL, ADMIN_PASSWORD, VICTIM, None)
+            .await
+            .status,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn forwarded_for_from_an_untrusted_peer_is_ignored() {
+    // No TRUSTED_PROXIES: a client rotating X-Forwarded-For values still has one identity.
+    let app = TestApp::with(|c| c.login_max_attempts = 2).await;
+    for spoof in ["1.1.1.1", "2.2.2.2"] {
+        let res = app
+            .try_login_from(ADMIN_EMAIL, "wrong", ATTACKER, Some(spoof))
+            .await;
+        assert_eq!(res.status, StatusCode::UNAUTHORIZED);
+    }
+    let res = app
+        .try_login_from(ADMIN_EMAIL, "wrong", ATTACKER, Some("3.3.3.3"))
+        .await;
+    assert_eq!(res.status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn forwarded_for_from_a_trusted_proxy_identifies_the_client() {
+    let app = TestApp::with(|c| {
+        c.login_max_attempts = 2;
+        c.trusted_proxies = parse_trusted_proxies("10.0.1.0/24").unwrap();
+    })
+    .await;
+    let frontend = "10.0.1.4";
+    // Traefik appends the address it saw as the rightmost entry; the client wrote the rest.
+    for spoof in ["9.9.9.9", "8.8.8.8"] {
+        let xff = format!("{spoof}, {ATTACKER}");
+        let res = app
+            .try_login_from(ADMIN_EMAIL, "wrong", frontend, Some(&xff))
+            .await;
+        assert_eq!(res.status, StatusCode::UNAUTHORIZED);
+    }
+    // Faking a different leftmost entry doesn't escape the lock...
+    let xff = format!("{VICTIM}, {ATTACKER}");
+    let res = app
+        .try_login_from(ADMIN_EMAIL, ADMIN_PASSWORD, frontend, Some(&xff))
+        .await;
+    assert_eq!(res.status, StatusCode::TOO_MANY_REQUESTS);
+    // ...and the real user behind the same proxy is not affected.
+    let res = app
+        .try_login_from(ADMIN_EMAIL, ADMIN_PASSWORD, frontend, Some(VICTIM))
+        .await;
+    assert_eq!(res.status, StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_login_attempts_cannot_exceed_the_limit() {
+    let app = TestApp::with(|c| c.login_max_attempts = 3).await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(20));
+    let tasks: Vec<_> = (0..20)
+        .map(|_| {
+            let (router, barrier) = (app.router.clone(), barrier.clone());
+            tokio::spawn(async move {
+                barrier.wait().await;
+                send_to(&router, login_request(ADMIN_EMAIL, "wrong", ATTACKER, None))
+                    .await
+                    .status
+            })
+        })
+        .collect();
+    let mut statuses = Vec::new();
+    for t in tasks {
+        statuses.push(t.await.unwrap());
+    }
+    let unauthorized = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::UNAUTHORIZED)
+        .count();
+    let limited = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::TOO_MANY_REQUESTS)
+        .count();
+    assert_eq!((unauthorized, limited), (3, 17), "{statuses:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn login_flood_is_refused_with_503_instead_of_exhausting_memory() {
+    let app = TestApp::new().await;
+    // One hashing slot and almost no queueing, so a burst must overflow.
+    let router = app.with_hashing(HashLimiter::new(1, Duration::from_millis(1)));
+    let barrier = Arc::new(tokio::sync::Barrier::new(16));
+    let tasks: Vec<_> = (0..16)
+        .map(|i| {
+            let (router, barrier) = (router.clone(), barrier.clone());
+            tokio::spawn(async move {
+                barrier.wait().await;
+                // Different addresses, so the login rate limit doesn't interfere.
+                let peer = format!("10.9.0.{i}");
+                send_to(&router, login_request(ADMIN_EMAIL, "wrong", &peer, None)).await
+            })
+        })
+        .collect();
+    let mut busy = 0;
+    for t in tasks {
+        let res = t.await.unwrap();
+        match res.status {
+            StatusCode::UNAUTHORIZED => {}
+            StatusCode::SERVICE_UNAVAILABLE => {
+                busy += 1;
+                assert!(res.headers.get(header::RETRY_AFTER).is_some());
+                assert!(res.error().contains("busy"), "{}", res.error());
+            }
+            other => panic!("unexpected {other}: {}", res.body),
+        }
+    }
+    assert!(busy > 0, "expected some requests to be refused");
+    // Refused attempts were not counted as failures, and normal logins work once it is quiet.
+    let res = send_to(
+        &router,
+        login_request(ADMIN_EMAIL, ADMIN_PASSWORD, "10.9.0.1", None),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+}
+
 #[tokio::test]
 async fn database_outage_returns_503_without_leaking_details() {
     let app = TestApp::new().await;
     let admin = app.admin().await;
-    let dead = Db::open(&DbTarget::parse("http://127.0.0.1:9", None).unwrap())
-        .await
-        .unwrap();
+    // Nothing listens on port 9: every connection attempt fails.
+    let mut settings = DbSettings::new("postgres://nobody:s3cret-pw@127.0.0.1:9/hourwise").unwrap();
+    settings.acquire_timeout = std::time::Duration::from_secs(2);
+    let dead = Db::connect_lazy(&settings).unwrap();
     let router = app.with_db(dead);
     let res = send_to(
         &router,
         build(Method::GET, "/api/me", None, Some(&admin), true),
     )
     .await;
-    assert!(
-        res.status == StatusCode::SERVICE_UNAVAILABLE
-            || res.status == StatusCode::INTERNAL_SERVER_ERROR,
-        "{}",
-        res.status
-    );
+    assert_eq!(res.status, StatusCode::SERVICE_UNAVAILABLE, "{}", res.body);
     let msg = res.error();
-    assert!(!msg.contains("127.0.0.1"), "{msg}");
-    assert!(!msg.to_lowercase().contains("hrana"), "{msg}");
+    for secret in ["127.0.0.1", "nobody", "s3cret-pw", "postgres", "sqlx"] {
+        assert!(!msg.to_lowercase().contains(secret), "{msg}");
+    }
 }
 
 #[tokio::test]
@@ -631,9 +800,9 @@ async fn passwords_are_stored_hashed() {
     let admin = app.admin().await;
     app.create_user(&admin, "hash@test.local", "plaintext-secret", "member")
         .await;
-    let conn = app.state.db.conn().await.unwrap();
+    let mut conn = app.conn().await;
     let hash = db::query_records(
-        &conn,
+        &mut conn,
         "SELECT password_hash FROM users WHERE email = 'hash@test.local'",
         args![],
     )

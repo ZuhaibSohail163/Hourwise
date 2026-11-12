@@ -8,7 +8,9 @@ use axum::{
     body::Body,
     http::{header, Method, Request, StatusCode},
 };
-use chrono::{Datelike, Duration};
+use std::sync::Arc;
+
+use chrono::{Datelike, Duration, NaiveDate};
 use common::*;
 use hourwise_backend::{args, db};
 use serde_json::json;
@@ -342,11 +344,11 @@ async fn admin_user_management() {
             .status,
         StatusCode::NO_CONTENT
     );
-    let conn = app.state.db.conn().await.unwrap();
+    let mut conn = app.conn().await;
     let left = db::query_i64(
-        &conn,
-        "SELECT (SELECT COUNT(*) FROM users WHERE id = ?1) + (SELECT COUNT(*) FROM project_members WHERE user_id = ?1)",
-        args![id.as_str()],
+        &mut conn,
+        "SELECT (SELECT COUNT(*) FROM users WHERE id = $1) + (SELECT COUNT(*) FROM project_members WHERE user_id = $1)",
+        args![uuid::Uuid::parse_str(&id).unwrap()],
     )
     .await
     .unwrap();
@@ -500,9 +502,9 @@ async fn timesheet_create_edit_delete() {
             .status,
         StatusCode::NOT_FOUND
     );
-    let conn = app.state.db.conn().await.unwrap();
+    let mut conn = app.conn().await;
     assert_eq!(
-        db::query_i64(&conn, "SELECT COUNT(*) FROM time_entries", args![])
+        db::query_i64(&mut conn, "SELECT COUNT(*) FROM time_entries", args![])
             .await
             .unwrap(),
         0
@@ -610,27 +612,34 @@ async fn daily_24_hour_cap() {
     assert_eq!(edit.status, StatusCode::BAD_REQUEST);
 }
 
-/// Regression + concurrency: simultaneous submissions can't overshoot the daily cap.
-#[tokio::test]
-async fn daily_cap_holds_under_concurrent_requests() {
-    let app = TestApp::new().await;
-    let admin = app.admin().await;
-    let (_u, project, s) = app.member_on_project(&admin, "race@test.local").await;
-    let day = today();
-
+/// Sends `count` simultaneous entries of `minutes` for one user and day (on a multi-threaded
+/// runtime, so they really run in parallel). Returns how many were created.
+async fn race(
+    app: &TestApp,
+    s: &Session,
+    project: &str,
+    day: NaiveDate,
+    count: usize,
+    minutes: i64,
+) -> usize {
+    let barrier = Arc::new(tokio::sync::Barrier::new(count));
     let mut tasks = Vec::new();
-    for _ in 0..12 {
+    for _ in 0..count {
         let router = app.router.clone();
+        let barrier = barrier.clone();
         let req = build(
             Method::POST,
             "/api/time-entries",
-            Some(json!({ "project_id": project, "entry_date": day.to_string(), "minutes": 180 })),
-            Some(&s),
+            Some(
+                json!({ "project_id": project, "entry_date": day.to_string(), "minutes": minutes }),
+            ),
+            Some(s),
             true,
         );
-        tasks.push(tokio::spawn(
-            async move { send_to(&router, req).await.status },
-        ));
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            send_to(&router, req).await.status
+        }));
     }
     let mut created = 0;
     for t in tasks {
@@ -641,11 +650,35 @@ async fn daily_cap_holds_under_concurrent_requests() {
             assert_eq!(status, StatusCode::BAD_REQUEST);
         }
     }
-    assert_eq!(created, 8, "1440 / 180 = 8 entries fit in one day");
+    created
+}
+
+/// Regression + concurrency: simultaneous submissions can't overshoot the daily cap
+/// (protected by a per-user row lock inside the transaction).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn daily_cap_holds_under_concurrent_requests() {
+    let app = TestApp::new().await;
+    let admin = app.admin().await;
+    let (_u, project, s) = app.member_on_project(&admin, "race@test.local").await;
+
+    let day = today();
+    assert_eq!(
+        race(&app, &s, &project, day, 12, 180).await,
+        8,
+        "1440 / 180 = 8 entries fit"
+    );
     let list = app
         .get(&format!("/api/time-entries?from={day}&to={day}"), &s)
         .await;
     assert_eq!(total_minutes(&list.body), 1440);
+
+    // All requests read the same empty day at once: exactly one 1000-minute entry may win.
+    let day = today() - Duration::days(1);
+    assert_eq!(race(&app, &s, &project, day, 16, 1000).await, 1);
+    let list = app
+        .get(&format!("/api/time-entries?from={day}&to={day}"), &s)
+        .await;
+    assert_eq!(total_minutes(&list.body), 1000);
 }
 
 /// Regression: only active projects the user belongs to can receive time.
@@ -738,24 +771,25 @@ async fn deleting_projects_and_users_cascades() {
     app.add_member(&admin, &second, &user).await;
     app.log_time(&s, &second, today(), 60, "").await;
 
-    let conn = app.state.db.conn().await.unwrap();
-    let entries = || async {
-        db::query_i64(&conn, "SELECT COUNT(*) FROM time_entries", args![])
-            .await
-            .unwrap()
-    };
-    assert_eq!(entries().await, 2);
+    assert_eq!(count_entries(&app).await, 2);
     app.delete(&format!("/api/admin/projects/{project}"), &admin)
         .await;
-    assert_eq!(entries().await, 1);
+    assert_eq!(count_entries(&app).await, 1);
     app.delete(&format!("/api/admin/users/{user}"), &admin)
         .await;
-    assert_eq!(entries().await, 0);
-    assert!(app.state.db.is_remote() || backup_ok(&app).await);
+    assert_eq!(count_entries(&app).await, 0);
+    assert!(verify_ok(&app).await);
 }
 
-async fn backup_ok(app: &TestApp) -> bool {
-    hourwise_backend::backup::verify(&app.state.db)
+async fn count_entries(app: &TestApp) -> i64 {
+    let mut conn = app.conn().await;
+    db::query_i64(&mut conn, "SELECT COUNT(*) FROM time_entries", args![])
+        .await
+        .unwrap()
+}
+
+async fn verify_ok(app: &TestApp) -> bool {
+    hourwise_backend::verify::verify(&app.state.db)
         .await
         .unwrap()
         .ok()

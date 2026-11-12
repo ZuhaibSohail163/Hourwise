@@ -31,12 +31,13 @@ Thumbs.db
 coverage/
 *.log
 
-# Local libSQL / SQLite databases and backups (may contain employee data)
+# Database backups and leftover local database files (may contain employee data)
+backups/
+*.dump
 backend/data/
 *.db
 *.db-wal
 *.db-shm
-backups/
 *.backup.sql
 
 # Playwright

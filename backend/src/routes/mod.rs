@@ -5,16 +5,52 @@ mod me;
 mod projects;
 
 use axum::{
+    extract::State,
+    http::StatusCode,
     routing::{get, patch, post, put},
-    Router,
+    Json, Router,
 };
 use chrono::{Datelike, Duration, NaiveDate, Utc};
+use serde_json::{json, Value};
 
 use crate::{error::AppError, AppState};
 
+/// Liveness: the process is up and serving HTTP. Doesn't touch the database, so a database
+/// outage doesn't make the orchestrator restart healthy backend containers.
+async fn health() -> &'static str {
+    "ok"
+}
+
+/// Readiness: the database answers within 3 seconds. Use it for load balancers / monitoring.
+/// The error detail is logged, never returned.
+async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
+    match tokio::time::timeout(std::time::Duration::from_secs(3), state.db.ping()).await {
+        Ok(Ok(())) => (
+            StatusCode::OK,
+            Json(json!({ "status": "ok", "database": "ok" })),
+        ),
+        Ok(Err(e)) => {
+            tracing::warn!("readiness check failed: {}", e.detail());
+            unavailable()
+        }
+        Err(_) => {
+            tracing::warn!("readiness check timed out");
+            unavailable()
+        }
+    }
+}
+
+fn unavailable() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "status": "unavailable", "database": "unavailable" })),
+    )
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/health", get(|| async { "ok" }))
+        .route("/health", get(health))
+        .route("/health/ready", get(ready))
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
         .route("/me", get(me::get_me).patch(me::update_me))

@@ -5,19 +5,22 @@
 //! hourwise-backend serve           # same
 //! hourwise-backend migrate         # apply pending migrations and exit
 //! hourwise-backend check-db        # test connectivity + credentials and exit
-//! hourwise-backend verify          # data-integrity report (exit code 1 on problems)
-//! hourwise-backend backup <file>   # write a logical SQL backup (use `-` for stdout)
-//! hourwise-backend restore <file>  # restore a backup into an EMPTY database
+//! hourwise-backend verify          # read-only data-integrity report (exit 1 on problems)
+//! hourwise-backend healthcheck     # exit 0 if the local API answers /api/health (Docker)
+//! hourwise-backend healthcheck --ready   # same, but also requires the database (/api/health/ready)
 //! ```
+//!
+//! Backups use PostgreSQL's own tools (`pg_dump` / `pg_restore`); see the README.
 
-use std::process::ExitCode;
+use std::{process::ExitCode, time::Duration};
 
-use hourwise_backend::{backup, config, db, migrate};
+use hourwise_backend::{config, db, migrate, verify};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::EnvFilter;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: hourwise-backend [serve | migrate | check-db | verify | backup <file|-> | restore <file>]"
+        "usage: hourwise-backend [serve | migrate | check-db | verify | healthcheck [--ready]]"
     );
     ExitCode::from(2)
 }
@@ -37,9 +40,8 @@ async fn main() -> ExitCode {
     let command = args.first().map(String::as_str).unwrap_or("serve");
     let result = match command {
         "serve" => serve().await,
-        "migrate" | "check-db" | "verify" | "backup" | "restore" => {
-            db_command(command, args.get(1).map(String::as_str)).await
-        }
+        "migrate" | "check-db" | "verify" => db_command(command).await,
+        "healthcheck" => return healthcheck(args.get(1).is_some_and(|a| a == "--ready")).await,
         "-h" | "--help" | "help" => {
             usage();
             return ExitCode::SUCCESS;
@@ -58,10 +60,11 @@ async fn main() -> ExitCode {
 async fn serve() -> Result<ExitCode, String> {
     let config = config::Config::from_env();
     let bind_addr = config.bind_addr.clone();
-    // Retry for ~1 minute: Turso Cloud or the network may be briefly unavailable at boot.
+    // Retry for ~1 minute: PostgreSQL may still be starting when the container boots.
     let state = hourwise_backend::init_state(config, 12)
         .await
         .map_err(|e| format!("startup failed: {}", e.detail()))?;
+    let db = state.db.clone();
     let app = hourwise_backend::app(state);
 
     let listener = tokio::net::TcpListener::bind(&bind_addr)
@@ -75,6 +78,8 @@ async fn serve() -> Result<ExitCode, String> {
     .with_graceful_shutdown(shutdown_signal())
     .await
     .map_err(|e| format!("server error: {e}"))?;
+    tracing::info!("shutting down: closing database connections");
+    db.close().await;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -97,22 +102,21 @@ async fn shutdown_signal() {
     }
 }
 
-async fn db_command(command: &str, arg: Option<&str>) -> Result<ExitCode, String> {
-    let target = config::database_from_env()?;
-    eprintln!("database: {}", target.describe());
-    let database = db::open_with_retry(&target, 3)
+async fn db_command(command: &str) -> Result<ExitCode, String> {
+    let settings = config::database_from_env()?;
+    eprintln!("database: {}", settings.describe());
+    let database = db::connect_with_retry(&settings, 3)
         .await
         .map_err(|e| format!("cannot connect: {}", e.detail()))?;
     let err = |e: hourwise_backend::error::AppError| e.detail();
 
     match command {
         "check-db" => {
-            let conn = database.conn().await.map_err(err)?;
-            let applied = migrate::applied(&conn).await.map_err(err)?;
+            let applied = migrate::applied(&database).await.map_err(err)?;
             eprintln!(
                 "connection OK; {} of {} migrations applied",
                 applied.len(),
-                migrate::MIGRATIONS.len()
+                migrate::known()
             );
         }
         "migrate" => {
@@ -120,7 +124,7 @@ async fn db_command(command: &str, arg: Option<&str>) -> Result<ExitCode, String
             eprintln!("applied {n} migration(s); schema is up to date");
         }
         "verify" => {
-            let report = backup::verify(&database).await.map_err(err)?;
+            let report = verify::verify(&database).await.map_err(err)?;
             for (table, n) in &report.counts {
                 eprintln!("  {table:<16} {n}");
             }
@@ -136,30 +140,43 @@ async fn db_command(command: &str, arg: Option<&str>) -> Result<ExitCode, String
                 return Ok(ExitCode::FAILURE);
             }
         }
-        "backup" => {
-            let path = arg.ok_or("backup needs a file path (or `-` for stdout)")?;
-            let text = backup::export(&database).await.map_err(err)?;
-            if path == "-" {
-                use std::io::Write;
-                std::io::stdout()
-                    .write_all(text.as_bytes())
-                    .map_err(|e| e.to_string())?;
-            } else {
-                std::fs::write(path, &text).map_err(|e| format!("cannot write {path}: {e}"))?;
-                eprintln!("backup written to {path} ({} bytes)", text.len());
-            }
-        }
-        "restore" => {
-            let path = arg.ok_or("restore needs a backup file path")?;
-            let text =
-                std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-            let counts = backup::import(&database, &text).await.map_err(err)?;
-            eprintln!("restore complete:");
-            for (table, n) in &counts {
-                eprintln!("  {table:<16} {n}");
-            }
-        }
         _ => return Ok(usage()),
     }
+    database.close().await;
     Ok(ExitCode::SUCCESS)
+}
+
+/// Minimal HTTP probe of the local server, so the runtime image needs no curl/wget.
+async fn healthcheck(ready: bool) -> ExitCode {
+    let bind = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
+    let port = bind.rsplit(':').next().unwrap_or("8080");
+    let path = if ready {
+        "/api/health/ready"
+    } else {
+        "/api/health"
+    };
+    let probe = async {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port.parse().ok()?))
+            .await
+            .ok()?;
+        let request = format!(
+            "GET {path} HTTP/1.0
+Host: localhost
+Connection: close
+
+"
+        );
+        stream.write_all(request.as_bytes()).await.ok()?;
+        let mut buf = [0u8; 64];
+        let n = stream.read(&mut buf).await.ok()?;
+        let head = String::from_utf8_lossy(&buf[..n]).to_string();
+        Some(head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200"))
+    };
+    match tokio::time::timeout(Duration::from_secs(4), probe).await {
+        Ok(Some(true)) => ExitCode::SUCCESS,
+        _ => {
+            eprintln!("unhealthy: {path} on port {port} did not return 200");
+            ExitCode::FAILURE
+        }
+    }
 }
