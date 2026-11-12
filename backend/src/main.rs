@@ -43,7 +43,8 @@ async fn main() -> ExitCode {
         "migrate" | "check-db" | "verify" => db_command(command).await,
         "healthcheck" => return healthcheck(args.get(1).is_some_and(|a| a == "--ready")).await,
         "-h" | "--help" | "help" => {
-            usage();
+            // Print the usage text, but asking for help is a success (exit 0), not an error (2).
+            let _ = usage();
             return ExitCode::SUCCESS;
         }
         _ => return usage(),
