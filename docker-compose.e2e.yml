@@ -8,14 +8,16 @@ name: hourwise-e2e
 
 services:
   db:
-    image: postgres:17-alpine
+    image: postgres:18-alpine
     environment:
       POSTGRES_USER: hourwise_e2e
       POSTGRES_PASSWORD: hourwise_e2e
       POSTGRES_DB: hourwise_e2e
     command: ["postgres", "-c", "fsync=off", "-c", "synchronous_commit=off"]
     tmpfs:
-      - /var/lib/postgresql/data
+      # PostgreSQL 18+ images keep data under /var/lib/postgresql/18/docker and refuse a
+      # mount at the old /var/lib/postgresql/data path.
+      - /var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U hourwise_e2e -d hourwise_e2e"]
       interval: 2s

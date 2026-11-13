@@ -90,8 +90,20 @@ Also choose an **initial admin email and password** (`ADMIN_EMAIL`, `ADMIN_PASSW
    - Database Name: `hourwise`
    - User: `hourwise`
    - Password: the hex password from step 3
-   - Docker image: `postgres:17` *(check in UI: the field offers a default image; choose 14 or
+   - Docker image: `postgres:18` *(check in UI: the field offers a default image; choose 14 or
      newer)*
+   - **Set the image before the first deploy.** PostgreSQL 18 images keep their data in
+     `/var/lib/postgresql/18/docker` instead of the older `/var/lib/postgresql/data`, and Dokploy
+     picks the volume's mount path from the image when the service is created. After creating it,
+     check under **Advanced → Volumes** *(check in UI)* that the mount path is
+     `/var/lib/postgresql/18/docker` or `/var/lib/postgresql`. If it is `/var/lib/postgresql/data`,
+     the container refuses to start with "in 18+, these Docker images are configured to store
+     database data in a format which is compatible with pg_ctlcluster".
+   - **Already running PostgreSQL 17?** Don't just change the image tag on the existing service.
+     PostgreSQL 18 can't open data files written by 17, and Dokploy doesn't move the volume. Instead,
+     take a backup (section 7), create a **new** `postgres:18` service, restore the backup into it,
+     check it, then point the backend's `DATABASE_URL` at the new service. Keep the old service
+     (stopped) until you are sure.
 3. **Deploy** the database.
 4. Open its **Connection** section and note the **Internal Host** and the **Internal Connection
    URL**. That URL is the backend's `DATABASE_URL`. Its host is the database's internal service
@@ -345,7 +357,7 @@ private bucket, a key that can only write to that bucket, and provider-side encr
 # On any machine with Docker, using a downloaded backup file. Nothing here touches production:
 # the container is throwaway (--rm) and keeps its data only until it stops.
 gunzip -k <backup>.sql.gz          # if it is gzipped; the result is the pg_dump archive
-docker run -d --rm --name hw-restore-test -e POSTGRES_PASSWORD=test postgres:17
+docker run -d --rm --name hw-restore-test -e POSTGRES_PASSWORD=test postgres:18
 # Wait until PostgreSQL accepts connections (the first start takes a few seconds).
 # The image briefly starts a temporary server during initialisation, so require
 # several successful checks in a row before continuing.

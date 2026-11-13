@@ -1,11 +1,11 @@
 #!/usr/bin/env node
-// Resets the LOCAL DEVELOPMENT PostgreSQL database (Docker volume `hourwise_postgres_data`).
+// Resets the LOCAL DEVELOPMENT PostgreSQL database (Docker volume `hourwise_postgres18_data`).
 //
 //   npm run db:reset             # shows what would be deleted, deletes nothing
 //   npm run db:reset -- --yes    # deletes the local dev database and starts an empty one
 //
 // It only ever removes that one Docker volume of the `hourwise` compose project. It never touches
-// the legacy `hourwise_pgdata` volume, the uploads volume, the test servers, or any remote or
+// the legacy `hourwise_postgres_data` (PostgreSQL 17) or `hourwise_pgdata` volumes, the uploads volume, the test servers, or any remote or
 // production database. Take a backup first if the data matters: `npm run backup`.
 
 import { spawnSync } from "node:child_process";
@@ -13,7 +13,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const VOLUME = "hourwise_postgres_data";
+const VOLUME = "hourwise_postgres18_data";
 
 function docker(args, inherit = true) {
   const res = spawnSync("docker", args, { cwd: root, stdio: inherit ? "inherit" : "pipe" });

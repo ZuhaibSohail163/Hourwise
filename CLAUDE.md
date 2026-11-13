@@ -41,7 +41,7 @@ Hourwise is a team time-tracking web app (Harvest-like). There are two roles:
   - `src/components/SummaryReport.tsx` is the shared report (totals, charts, work log, CSV via `lib/csv.ts`).
   - `src/lib/time.ts` has date and duration helpers. Weeks start Monday (`WEEK_OPTS`).
   - Tests: `src/__tests__/*.test.ts(x)` (Vitest + RTL, `src/test/` holds setup and fixtures) and `e2e/` (Playwright).
-- `docker-compose.yml`: `db` (PostgreSQL 17, volume `postgres_data`, port bound to 127.0.0.1), `backend`, `frontend`.
+- `docker-compose.yml`: `db` (PostgreSQL 18, volume `postgres18_data` mounted at `/var/lib/postgresql`, port bound to 127.0.0.1), `backend`, `frontend`.
   `docker-compose.test.yml`: disposable tmpfs PostgreSQL for the Rust tests (127.0.0.1:55432, `hourwise.disposable=on`).
   `docker-compose.e2e.yml`: isolated tmpfs stack for Playwright. `docs/DEPLOYMENT.md`: Dokploy production setup.
 
