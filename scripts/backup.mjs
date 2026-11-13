@@ -77,8 +77,8 @@ const check = `hourwise-restore-check-${randomBytes(4).toString("hex")}`;
 const started = docker([
   "run", "-d", "--rm", "--name", check,
   "-e", "POSTGRES_PASSWORD=restore-check-only", "-e", "POSTGRES_DB=restore_check",
-  "--tmpfs", "/var/lib/postgresql/data",
-  "postgres:17-alpine",
+  "--tmpfs", "/var/lib/postgresql",
+  "postgres:18-alpine",
 ]);
 if (started.status !== 0) fail("could not start the throwaway restore container", started);
 let ok = false;

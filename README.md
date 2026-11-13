@@ -8,7 +8,7 @@ members, and see who worked on what, for how long and what they did.
 - **Backend:** Rust ([axum](https://github.com/tokio-rs/axum)) REST API with
   [SQLx](https://github.com/launchbadge/sqlx) and a PostgreSQL connection pool
 - **Frontend:** Next.js 16 (App Router, React 19, TypeScript, Tailwind CSS 4)
-- **Database:** PostgreSQL 14+ (17 in Docker)
+- **Database:** PostgreSQL 14+ (18 in Docker)
 - **Packaging:** Docker images for both apps. Docker Compose for local development. Production
   deployment with [Dokploy](https://dokploy.com): see **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**.
 
@@ -118,12 +118,49 @@ the backend applies the migrations and creates that admin.
 | Apply migrations (normally automatic) | `npm run db:migrate` |
 | Integrity report (read-only) | `npm run db:verify` |
 | **Verified backup** | `npm run backup` → `backups/hourwise-<timestamp>.dump` |
-| **Reset the local dev database** | `npm run db:reset -- --yes` (deletes only the `hourwise_postgres_data` volume) |
+| **Reset the local dev database** | `npm run db:reset -- --yes` (deletes only the `hourwise_postgres18_data` volume) |
 
-Local data lives in Docker volumes: `hourwise_postgres_data` (PostgreSQL) and `hourwise_uploads`
+Local data lives in Docker volumes: `hourwise_postgres18_data` (PostgreSQL) and `hourwise_uploads`
 (avatars). `docker compose down -v` would delete **both**. Prefer `npm run db:reset`, which only
 deletes the database and asks for `--yes`. Volumes left over from earlier versions
-(`hourwise_pgdata`, `hourwise_dbdata`) are not used or touched by this version.
+(`hourwise_postgres_data` from PostgreSQL 17, `hourwise_pgdata`, `hourwise_dbdata`) are not used
+or touched by this version.
+
+### Upgrading the local database from PostgreSQL 17
+
+The stack now runs PostgreSQL 18 on a new volume, `hourwise_postgres18_data`. PostgreSQL 18 can't
+open 17's data files, so the first `docker compose up` starts with an **empty** database. Your
+data is still in the old `hourwise_postgres_data` volume. To copy it over, run this in Git Bash
+from the repo root. It only reads from the old volume and never deletes it.
+
+```bash
+# 1. The new database must be empty. If you already started the backend on PostgreSQL 18, it
+#    created the schema and admin there: run `npm run db:reset -- --yes` first (this deletes only
+#    the new 18 volume).
+docker compose stop backend
+docker compose up -d --wait db
+
+# 2. Dump the PostgreSQL 17 data with a temporary 17 container on the old volume.
+#    MSYS_NO_PATHCONV stops Git Bash from rewriting the container paths.
+export MSYS_NO_PATHCONV=1
+docker run -d --rm --name hw-pg17 -v hourwise_postgres_data:/var/lib/postgresql/data postgres:17-alpine
+ok=0; for i in $(seq 1 60); do
+  if docker exec hw-pg17 pg_isready -U hourwise -d hourwise -q; then ok=$((ok+1)); [ "$ok" -ge 3 ] && break; else ok=0; fi
+  sleep 1
+done
+docker exec hw-pg17 pg_dump -U hourwise -d hourwise --format=custom --no-owner --no-privileges -f /tmp/pg17.dump
+docker cp hw-pg17:/tmp/pg17.dump backups/pg17-upgrade.dump
+docker stop hw-pg17
+
+# 3. Restore into PostgreSQL 18, check it, and start the rest of the stack.
+docker cp backups/pg17-upgrade.dump "$(docker compose ps -q db)":/tmp/pg17.dump
+docker compose exec -T db pg_restore -U hourwise -d hourwise --no-owner --exit-on-error /tmp/pg17.dump
+docker compose up -d
+npm run db:verify
+```
+
+Replace `hourwise` with your `POSTGRES_USER` / `POSTGRES_DB` if you changed them. When you're
+satisfied, you can remove the old volume yourself with `docker volume rm hourwise_postgres_data`.
 
 ---
 
