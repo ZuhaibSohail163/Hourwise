@@ -10,7 +10,7 @@ name: hourwise-test
 
 services:
   postgres-test:
-    image: postgres:17-alpine
+    image: postgres:18-alpine
     environment:
       POSTGRES_USER: hourwise_test
       POSTGRES_PASSWORD: hourwise_test
@@ -28,7 +28,9 @@ services:
       - -c
       - full_page_writes=off
     tmpfs:
-      - /var/lib/postgresql/data
+      # PostgreSQL 18+ images keep data under /var/lib/postgresql/18/docker and refuse a
+      # mount at the old /var/lib/postgresql/data path.
+      - /var/lib/postgresql
     ports:
       - "127.0.0.1:55432:5432"
     healthcheck:

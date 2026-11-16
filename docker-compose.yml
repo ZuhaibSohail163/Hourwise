@@ -5,24 +5,27 @@ name: hourwise
 #   docker compose up -d --build     # everything, at http://localhost:3000
 #   docker compose up -d db          # only PostgreSQL (for `npm run dev:backend`)
 #   docker compose logs -f backend   # logs
-#   docker compose down              # stop (data is kept in the `postgres_data` volume)
+#   docker compose down              # stop (data is kept in the `postgres18_data` volume)
 #
 # Settings come from the root `.env` (copy `.env.example`). Nothing here is a production
 # credential; production runs on Dokploy (see README -> "Deploying with Dokploy").
 #
-# The volume is deliberately named `postgres_data`, not `pgdata`: an older `hourwise_pgdata`
-# volume from a previous version may still exist and must not be mounted by accident.
+# The volume is deliberately named `postgres18_data`. PostgreSQL 18 cannot open the data files of
+# an older major version, so the PostgreSQL 17 volume (`hourwise_postgres_data`) and the even older
+# `hourwise_pgdata` are left untouched and never mounted. To carry data over from 17, see the README
+# ("Upgrading the local database from PostgreSQL 17").
 
 services:
   db:
-    image: postgres:17-alpine
+    image: postgres:18-alpine
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-hourwise}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-hourwise}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      # 18+ images keep data in /var/lib/postgresql/18/docker; mount the parent directory.
+      - postgres18_data:/var/lib/postgresql
     # Published on the loopback interface only, for `npm run dev:backend` and database tools.
     ports:
       - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
@@ -75,5 +78,5 @@ services:
       - "${FRONTEND_PORT:-3000}:3000"
 
 volumes:
-  postgres_data:
+  postgres18_data:
   uploads:
