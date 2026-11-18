@@ -34,9 +34,16 @@ ENV NODE_ENV=production \
 RUN addgroup -S nodejs && adduser -S nextjs -G nodejs
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+COPY --chown=nextjs:nodejs docker/healthcheck.mjs ./healthcheck.mjs
 USER nextjs
+# Git commit of this build, reported by /healthz. CI sets it (docs/CI-CD.md); other builds
+# report "unknown". Declared last so it never invalidates the cached layers above.
+ARG HOURWISE_REVISION=unknown
+ENV HOURWISE_REVISION=$HOURWISE_REVISION
 EXPOSE 3000
-# Liveness probe (no curl in the image): GET /healthz must return 200.
-HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
-    CMD ["node", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+# Health check (no curl in the image): /healthz must answer, and a NEW container only becomes
+# healthy once it has reached the backend through its /api proxy. Swarm therefore never sends
+# traffic to a frontend that can't reach the backend (see docker/healthcheck.mjs).
+HEALTHCHECK --interval=15s --timeout=10s --start-period=30s --retries=3 \
+    CMD ["node", "/app/healthcheck.mjs"]
 CMD ["node", "server.js"]

@@ -25,6 +25,24 @@ async fn health_endpoint() {
 }
 
 #[tokio::test]
+async fn readiness_reports_database_and_revision() {
+    let app = TestApp::new().await;
+    let res = app
+        .send(
+            Request::get("/api/health/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["status"], "ok");
+    assert_eq!(res.body["database"], "ok");
+    // Tests don't set HOURWISE_REVISION (only CI image builds do).
+    let revision = res.body["revision"].as_str().unwrap();
+    assert!(revision == "unknown" || revision.bytes().all(|b| b.is_ascii_hexdigit()));
+}
+
+#[tokio::test]
 async fn admin_is_seeded_once_and_can_log_in() {
     let app = TestApp::new().await;
     let res = app.try_login(ADMIN_EMAIL, ADMIN_PASSWORD).await;

@@ -44,6 +44,10 @@ Hourwise is a team time-tracking web app (Harvest-like). There are two roles:
 - `docker-compose.yml`: `db` (PostgreSQL 18, volume `postgres18_data` mounted at `/var/lib/postgresql`, port bound to 127.0.0.1), `backend`, `frontend`.
   `docker-compose.test.yml`: disposable tmpfs PostgreSQL for the Rust tests (127.0.0.1:55432, `hourwise.disposable=on`).
   `docker-compose.e2e.yml`: isolated tmpfs stack for Playwright. `docs/DEPLOYMENT.md`: Dokploy production setup.
+  `docs/CI-CD.md`: green `main` → GHCR images pinned by digest → Dokploy API deploy (`scripts/ci/dokploy-deploy.sh`,
+  tested by `npm run test:deploy-script`). Health endpoints report `revision` (`HOURWISE_REVISION`) for that check.
+  The frontend image's HEALTHCHECK (`frontend/docker/healthcheck.mjs`) only turns healthy once the backend was reached
+  through `/api`, so Swarm never routes traffic to a frontend that can't reach the backend. Keep that property.
 
 ## Commands
 **Before finishing any change, run `npm run format`, `npm run check` and `npm test` from the repo root.**

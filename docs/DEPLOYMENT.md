@@ -8,9 +8,16 @@ Dokploy UI labels below come from the official docs (<https://docs.dokploy.com>,
 2026-11). Labels marked *(check in UI)* were not confirmed in the docs. The setting is real, but
 the exact wording or place may differ in your Dokploy version.
 
+**How releases reach production:** GitHub Actions builds both images after every green merge to
+`main`, pushes them to GitHub Container Registry (GHCR), and deploys them through the Dokploy API.
+Dokploy only pulls and runs images; it doesn't build anything. This guide sets up the services. The
+pipeline, its GitHub settings and recovery are in **[CI-CD.md](CI-CD.md)**.
+
 ## 1. Architecture
 
 ```
+  GitHub Actions ── images pinned by digest ──► GHCR ◄── pulled by Dokploy on each deploy
+
                  Internet (HTTPS 443)
                         │
                  ┌──────▼──────┐   Let's Encrypt certificate for <app.example.com>
@@ -48,16 +55,18 @@ the exact wording or place may differ in your Dokploy version.
 You need:
 
 - **A Linux server (VPS)** with at least **2 GB RAM and 30 GB disk**. Dokploy's documented
-  minimum is Ubuntu 20.04–24.04, Debian 10–12, Fedora 40 or CentOS 8/9. Building the Rust
-  backend on the server needs about 2 GB of RAM free during the build. Use 4 GB, or add swap, to
-  be comfortable.
+  minimum is Ubuntu 20.04–24.04, Debian 10–12, Fedora 40 or CentOS 8/9. Images are built in
+  GitHub Actions, so the server only pulls and runs them. (Building the Rust backend on the server
+  instead, as in the fallback in section 5, needs about 2 GB of free RAM during the build.)
+- **On Dokploy Cloud** you don't install Dokploy: connect the server under **Remote Servers**, run
+  its setup, and create all three services on that server, so they share its `dokploy-network`.
 - **Ports 80, 443 and 3000 free and open** in the firewall. 3000 is Dokploy's own UI. You can
   close it later (see step 9).
 - **A domain name** you control, e.g. `<example.com>`, with a DNS **A record** for
   `<app.example.com>` → `<server-ip>`. Let's Encrypt needs this record to exist before you
   enable HTTPS.
-- **Hourwise in a Git repository** that Dokploy can read (GitHub, GitLab, Bitbucket, Gitea or a
-  plain Git URL).
+- **Hourwise on GitHub**, with GitHub Actions enabled. Release images go to GHCR under the
+  repository owner.
 - **Optional, for backups:** an S3-compatible bucket (see section 7). Paid or free tier is your
   choice; nothing is configured for you.
 
@@ -117,28 +126,30 @@ Also choose an **initial admin email and password** (`ADMIN_EMAIL`, `ADMIN_PASSW
 
 **Create Service → Application**, name `hourwise-backend`.
 
-**General → Source:** your repository and branch (e.g. `main`).
-
-**General → Build Type:** `Dockerfile`.
+**General → Provider: Docker** *(check in UI)*:
 
 | Field | Value |
 | --- | --- |
-| Dockerfile Path | `backend/Dockerfile` |
-| Docker Context Path | `backend` |
-| Docker Build Stage | *(empty)* |
+| Docker Image | a release image from the pipeline, e.g. `ghcr.io/<owner>/hourwise-backend:sha-<commit>@sha256:<digest>` (listed in the `publish` job summary). The pipeline replaces it on every deploy. |
+| Registry URL | `ghcr.io` |
+| Username | a GitHub user that can read the package |
+| Password | a GitHub **classic** token with only `read:packages` (GHCR doesn't accept fine-grained tokens) |
 
-> The Dockerfile expects the **`backend/` folder as its build context** (it copies `Cargo.toml`,
-> `src/` and `migrations/`). How Dokploy resolves the fields (checked in Dokploy's source,
-> `getBuildAppDirectory` / `getDockerContextPath`):
->
-> - **Dockerfile Path** is relative to the Git **Build Path** (default `/`, the repo root).
-> - **Docker Context Path** is relative to the **repo root**, never to Build Path. When it is
->   empty, the context is the folder that contains the Dockerfile.
->
-> The values above therefore give the context `backend/`. An equivalent alternative is Build Path
-> `/backend`, Dockerfile Path `Dockerfile` and Docker Context Path **left empty**. Do **not** put
-> `.` in Docker Context Path with that alternative: `.` means the repo root, and the build fails
-> because `Cargo.toml` is not there.
+**General → Auto Deploy: off.** Only the pipeline deploys (the preflight refuses to run when this
+is on).
+
+<details>
+<summary>Fallback: building from GitHub inside Dokploy (only if the pipeline is unavailable)</summary>
+
+Provider **GitHub**, your repository, branch `main`, Build Type **Dockerfile**, Dockerfile Path
+`backend/Dockerfile`, Docker Context Path `backend`. Dokploy's **Dockerfile Path** is relative to
+the Git Build Path (default the repo root). Its **Docker Context Path** is relative to the repo
+root; when empty, the context is the Dockerfile's folder. (Equivalent: Build Path `/backend`,
+Dockerfile Path `Dockerfile`, Context empty. Never `.`, which is the repo root.) This builds the
+tip of `main` at that moment, and the image reports `"revision": "unknown"`. Switch back to the
+Docker provider afterwards, or the pipeline's preflight will refuse to deploy.
+
+</details>
 
 **Environment** (runtime variables):
 
@@ -223,7 +234,9 @@ nanoseconds. No curl is needed: the binary probes itself.
 ```
 
 **Advanced → Swarm Settings → Update Config** (start the new container first, and roll back
-automatically if it never becomes healthy):
+automatically if it never becomes healthy). Leaving it empty gives the same behaviour, because
+Dokploy's default is `start-first` + `rollback`. The pipeline's preflight refuses any other
+setting.
 
 ```json
 {
@@ -251,8 +264,8 @@ automatically if it never becomes healthy):
 >
 > The uploads volume is shared by both containers.
 
-**Deploy.** The first build compiles Rust in release mode, which takes a few minutes. In the logs
-you should see:
+**Deploy** (normally done by the pipeline; the first time you can click Deploy once the image is
+set). Dokploy pulls the image and starts it. In the logs you should see:
 
 ```
 using PostgreSQL hourwise@<db-internal-host>:5432/hourwise
@@ -263,32 +276,29 @@ Hourwise API listening on 0.0.0.0:8080
 
 Note the backend's **internal service name** (the application's app name, e.g.
 `hourwise-backend-xxxxxx`, shown in the application's General/Advanced section *(check in UI)*).
-The frontend needs it.
+It becomes the GitHub variable `PRODUCTION_BACKEND_URL` = `http://<that name>:8080`.
+
+**Don't set `HOURWISE_REVISION`** in the environment. The image carries the commit it was built
+from, and the pipeline reads it back from `/api/health/ready`. Overriding it would make every
+deploy fail its revision check.
 
 ## 6. Frontend application
 
-**Create Service → Application**, name `hourwise-frontend`, same repository and branch.
+**Create Service → Application**, name `hourwise-frontend`.
 
-**General → Build Type:** `Dockerfile`.
+**General → Provider: Docker**, same fields as the backend, with the frontend image
+(`ghcr.io/<owner>/hourwise-frontend:sha-<commit>@sha256:<digest>`). **Auto Deploy: off.**
 
-| Field | Value |
-| --- | --- |
-| Dockerfile Path | `frontend/Dockerfile` |
-| Docker Context Path | `frontend` |
+**Where the backend address comes from.** Next.js fixes its `/api` and `/uploads` proxy target
+when the image is **built**. CI builds the frontend with `BACKEND_URL` = the GitHub variable
+`PRODUCTION_BACKEND_URL` (`http://<backend-internal-service-name>:8080`, the private name, never
+a public URL). The value isn't stored in the running image's environment. Before each deploy, the
+pipeline checks it against the backend's actual Dokploy service name. If you rename the backend
+service, update the variable; the next release rebuilds the frontend with it.
 
-(Same note as for the backend: the build context must be the `frontend/` folder.)
-
-**Environment → Build Time Arguments.** These are required. Next.js resolves its proxy
-destination at build time.
-
-```env
-BACKEND_URL=http://<backend-internal-service-name>:8080
-```
-
-- This must be the backend's **private** service name, not a public URL.
-- If you ever rename the backend service, rebuild the frontend.
-- Runtime environment variables: none required. `PORT=3000` and `HOSTNAME=0.0.0.0` are set in
-  the image.
+- No Build-time Arguments in Dokploy (nothing is built there).
+- Runtime environment variables: **none**. `PORT`, `HOSTNAME`, `NODE_ENV` and
+  `HOURWISE_REVISION` come from the image. Don't set `HOURWISE_REVISION` here (see the backend).
 
 **Domains → Add Domain:**
 
@@ -303,20 +313,29 @@ BACKEND_URL=http://<backend-internal-service-name>:8080
 `traefik.me` test domains are HTTP only. Hourwise's session cookies are `Secure`, so sign-in
 needs HTTPS: use your real domain.
 
-**Advanced → Swarm Settings → Health Check:**
+**Advanced → Swarm Settings → Health Check:** leave it **empty**, so the image's own check
+applies, or set exactly:
 
 ```json
 {
-  "Test": ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"],
+  "Test": ["CMD", "node", "/app/healthcheck.mjs"],
   "Interval": 15000000000,
-  "Timeout": 5000000000,
+  "Timeout": 10000000000,
   "StartPeriod": 30000000000,
   "Retries": 3
 }
 ```
 
-**Update Config:** the same JSON as the backend. **Replicas:** 1 is enough; the frontend is
-stateless, so more replicas are fine.
+That check (`frontend/docker/healthcheck.mjs`) only reports a **new** container healthy once it
+has reached the backend through its own `/api` proxy. Swarm sends traffic only to healthy tasks,
+and with `start-first` it keeps the old frontend running until the new one is healthy. So a
+frontend that can't reach the backend never takes traffic and is rolled back by Swarm. After that
+first success, only liveness counts, so a later backend outage doesn't get the frontend restarted.
+**Any other custom health check would bypass this.** An older JSON that only fetched `/healthz`
+is one example, and the pipeline's preflight refuses to deploy while one is set.
+
+**Update Config:** the same JSON as the backend (or empty). **Replicas:** 1 is enough; the
+frontend is stateless, so more replicas are fine.
 
 **Deploy**, then open `https://<app.example.com>` and sign in with the admin account.
 
@@ -412,32 +431,26 @@ Locally, `npm run backup` does the same automatically for the development databa
 
 After that, each one can be redeployed on its own.
 
-**Automatic deploys:** in each application's General tab, enable **Auto Deploy**. With the GitHub
-provider this works on push to the selected branch. For other providers, use the webhook URL shown
-in the application's deployment section (the docs mention both the Deployments tab and the
-deployment logs). Use **Watch Paths** so each app only redeploys when its own code changes:
-
-| Application | Watch Paths |
-| --- | --- |
-| hourwise-backend | `backend/**` |
-| hourwise-frontend | `frontend/**` |
+**Automatic deploys: use the GitHub Actions pipeline, not Dokploy's Auto Deploy.** See
+**[CI-CD.md](CI-CD.md)**. After every green merge to `main`, CI builds both images, pins them by
+digest and deploys them through the Dokploy API, backend first, verifying each step. Keep **Auto
+Deploy off** on both apps, so nothing else deploys. The pipeline refuses to run while it is on.
 
 **Rollbacks:**
 
-- **Automatic:** with the Health Check and `"FailureAction": "rollback"` above, a deployment
-  whose new container never becomes healthy is rolled back by Swarm.
-- **Manual (optional):** Deployments → Rollback Settings → enable rollbacks and choose a Docker
-  registry. Each deployment's image is then kept and offers a **Rollback** button. This needs a
-  registry account (Docker Hub, GHCR, …), which may cost money.
+- **Automatic (Swarm):** with `"FailureAction": "rollback"` (or Dokploy's default), a new
+  container that never becomes healthy is rolled back by Swarm. For the frontend, "healthy"
+  includes reaching the backend (section 6).
+- **Automatic (pipeline, frontend only):** if the frontend deploy or its checks fail, the pipeline
+  puts the previous frontend image back, redeploys it and checks the site answers again
+  ([CI-CD.md → Recovery](CI-CD.md#6-recovery-and-rollback)).
+- **Manual:** set the previous image reference (from GHCR or an earlier `publish` summary) in
+  Dokploy and deploy. The steps are in CI-CD.md.
 - **Database migrations are forward-only.** An older backend refuses to start against a database
-  migrated by a newer one ("has migration N applied, which this build doesn't know"). To roll
-  back across a schema change, restore the backup taken before the deploy (section 7). Take one
-  (**Test** button) before deploying a version with a new migration.
-
-**Building elsewhere (optional):** Dokploy recommends building images in CI or on a build server
-and deploying the image, so a large build doesn't slow the production server. The CI workflow in
-this repository already builds both images. Pushing them to a registry is a small addition if
-you want it later.
+  migrated by a newer one ("has migration N applied, which this build doesn't know"). That's why
+  the backend is never rolled back automatically. To roll back across a schema change, restore
+  the backup taken before the deploy (section 7). Take one (**Test** button) before merging a
+  release with a new migration.
 
 ## 9. Production checklist
 
@@ -449,9 +462,12 @@ you want it later.
 - [ ] `COOKIE_SECURE=true`. `CORS_ORIGIN` is unset.
 - [ ] `TRUSTED_PROXIES` = the `dokploy-network` subnet, and the backend log says `trusting
       X-Forwarded-For from …` (not `ignoring X-Forwarded-For`). The frontend has no published Ports.
-- [ ] `BACKEND_URL` build argument = `http://<backend-internal-service-name>:8080`.
+- [ ] Both apps use the **Docker** provider (GHCR, read-only token) with **Auto Deploy off**,
+      and neither sets `HOURWISE_REVISION`.
+- [ ] GitHub variable `PRODUCTION_BACKEND_URL` = `http://<backend-internal-service-name>:8080`.
 - [ ] `hourwise-uploads` volume mounted at `/data/uploads`.
-- [ ] Health checks and Update Config set on both apps. Replicas: backend 1.
+- [ ] Update Config `start-first` + `rollback` (or empty) on both apps. Frontend Swarm Health
+      Check empty or `["CMD","node","/app/healthcheck.mjs"]`. Replicas: backend 1.
 - [ ] First admin signed in and changed the password. `ADMIN_PASSWORD` removed from the
       environment.
 - [ ] Database backups scheduled to an off-server bucket, and one test backup restored
@@ -468,7 +484,9 @@ you want it later.
 | Backend log: `database not reachable (attempt n/12)`, then exit | Wrong internal host or password, or the database isn't deployed. Compare with the database's Connection section. A password with `@ : / #` must be percent-encoded. |
 | Backend log: `migration N was modified after it was applied` | A migration file was edited. Restore the original file and add a new migration instead. |
 | Backend log: `has migration N applied, which this build doesn't know` | You deployed an older backend against a newer schema. Deploy the newer version, or restore a backup. |
-| Site shows `502 Bad Gateway` for `/api/...` | The frontend's `BACKEND_URL` build argument is wrong, or the backend isn't healthy. Fix it and **rebuild** the frontend: the value is baked in at build time. |
+| Site shows `502 Bad Gateway` for `/api/...` | The backend isn't healthy, or the frontend image was built with the wrong backend address. Fix the GitHub variable `PRODUCTION_BACKEND_URL` and release again: the value is baked in at build time. (The preflight and the frontend health check normally catch this before traffic moves.) |
+| Deploy fails with `pull access denied` / `manifest unknown` | Dokploy can't read the GHCR image. Check the provider's Registry URL `ghcr.io`, username and `read:packages` token, and that the package is linked to the repository. |
+| Pipeline preflight fails | Its message names the setting: Docker provider, Auto Deploy, Update Config, frontend Health Check, `PRODUCTION_BACKEND_URL` vs the backend's service name, or a missing secret. See CI-CD.md. |
 | Login "works" but you're immediately signed out | The site isn't served over HTTPS, so the browser drops the `Secure` cookies. Enable HTTPS on the domain. |
 | `429 Too many failed attempts` | The login lockout for that email from that address, or for that address overall. Wait `LOGIN_LOCKOUT_SECS`, or restart the backend. If **everyone** gets it at once, `TRUSTED_PROXIES` is wrong (the log says `ignoring X-Forwarded-For`): see section 5. |
 | `503 The server is busy` on login | All `PASSWORD_HASH_CONCURRENCY` slots were busy for 5 s (a login burst or an attack). It recovers by itself. Raise the value only if the server has spare memory and CPU. |

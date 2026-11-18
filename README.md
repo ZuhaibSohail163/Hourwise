@@ -378,12 +378,16 @@ See **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**:
 
 - Dokploy prerequisites and installation
 - the PostgreSQL service
-- backend and frontend applications (Dockerfile paths, build arguments, environment, volume,
+- backend and frontend applications (Docker provider pulling GHCR images, environment, volume,
   health checks, update and rollback settings)
 - domain and HTTPS
 - backups and restore
 - deployment order, automatic deploys, rollbacks
 - a production checklist and troubleshooting
+
+Releases are automatic after every green merge to `main`: GitHub Actions builds the images,
+pushes them to GHCR pinned by digest, and deploys them through the Dokploy API, backend then
+frontend, each verified. See **[docs/CI-CD.md](docs/CI-CD.md)**.
 
 ### Docker images
 
@@ -487,6 +491,7 @@ Errors are returned as `{"error": "message"}` with the matching HTTP status.
 ├── docker-compose.test.yml   # disposable PostgreSQL for the Rust tests
 ├── docker-compose.e2e.yml    # isolated stack for the Playwright tests
 ├── docs/DEPLOYMENT.md        # Dokploy deployment, backups, checklist
+├── docs/CI-CD.md             # GitHub Actions release + production deploy pipeline
 ├── .env.example              # copy to .env
 ├── package.json              # repo-level scripts (no dependencies)
 ├── scripts/
@@ -494,8 +499,9 @@ Errors are returned as `{"error": "message"}` with the matching HTTP status.
 │   ├── test-backend.mjs      # starts the disposable test server and runs cargo test
 │   ├── backup.mjs            # verified pg_dump backups of the local database
 │   ├── db-reset.mjs          # resets only the local dev database volume
-│   └── e2e.mjs               # starts the isolated stack and runs Playwright
-├── .github/workflows/ci.yml
+│   ├── e2e.mjs               # starts the isolated stack and runs Playwright
+│   └── ci/                   # dokploy-deploy.sh (production deploy) + its mock-API tests
+├── .github/workflows/ci.yml  # checks on every PR/push; release + deploy on green main
 ├── backend/                  # Rust API
 │   ├── Dockerfile
 │   ├── migrations/           # PostgreSQL migrations (embedded with sqlx::migrate!)
