@@ -21,13 +21,27 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// The git commit this build was made from: `HOURWISE_REVISION`, set by the CI image build (see
+/// `docs/CI-CD.md`). The deploy pipeline reads it from `/api/health/ready` to confirm which
+/// release is actually serving traffic. Anything that isn't a hex commit id reports "unknown".
+fn revision() -> &'static str {
+    static REVISION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    REVISION.get_or_init(|| {
+        std::env::var("HOURWISE_REVISION")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| (7..=64).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_hexdigit()))
+            .unwrap_or_else(|| "unknown".into())
+    })
+}
+
 /// Readiness: the database answers within 3 seconds. Use it for load balancers / monitoring.
 /// The error detail is logged, never returned.
 async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     match tokio::time::timeout(std::time::Duration::from_secs(3), state.db.ping()).await {
         Ok(Ok(())) => (
             StatusCode::OK,
-            Json(json!({ "status": "ok", "database": "ok" })),
+            Json(json!({ "status": "ok", "database": "ok", "revision": revision() })),
         ),
         Ok(Err(e)) => {
             tracing::warn!("readiness check failed: {}", e.detail());
@@ -43,7 +57,7 @@ async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
 fn unavailable() -> (StatusCode, Json<Value>) {
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({ "status": "unavailable", "database": "unavailable" })),
+        Json(json!({ "status": "unavailable", "database": "unavailable", "revision": revision() })),
     )
 }
 

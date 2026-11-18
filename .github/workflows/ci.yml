@@ -1,9 +1,16 @@
 name: CI
 
+# Checks run on every pull request and every push to main. Only a push to main whose checks ALL
+# succeed can publish release images and deploy production (jobs `publish` and `deploy`, gated by
+# the repository variable PRODUCTION_PIPELINE). See docs/CI-CD.md.
 on:
   push:
     branches: [main]
   pull_request:
+
+# Least privilege by default; the two release jobs widen it for themselves only.
+permissions:
+  contents: read
 
 jobs:
   backend:
@@ -37,8 +44,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t hourwise-backend ./backend
-      - run: docker build --build-arg BACKEND_URL=http://backend:8080 -t hourwise-frontend ./frontend
+      - uses: docker/setup-buildx-action@v3
+      # Same Dockerfiles and contexts as production. Not pushed; the layer cache is shared with
+      # the `publish` job so a release doesn't compile everything again.
+      - name: Build backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: false
+          build-args: HOURWISE_REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,scope=backend,mode=max
+      - name: Build frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: false
+          build-args: |
+            BACKEND_URL=http://backend:8080
+            HOURWISE_REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,scope=frontend,mode=max
 
   frontend:
     name: Frontend (prettier + eslint + tsc + vitest + build)
@@ -80,3 +106,198 @@ jobs:
           name: playwright-results
           path: frontend/test-results
           retention-days: 7
+
+  deploy-script:
+    name: Deploy script (mock Dokploy API)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/ci/test-dokploy-deploy.mjs
+
+  # ---- Release: push to main only, after every check above has succeeded ----------------------
+  # `needs` + the implicit success() mean a failed, skipped or cancelled check stops the release.
+  # Pull requests and other branches never get here (event and ref are checked explicitly).
+
+  publish:
+    name: Publish release images
+    needs: [backend, images, frontend, e2e, deploy-script]
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      (vars.PRODUCTION_PIPELINE == 'publish' || vars.PRODUCTION_PIPELINE == 'deploy')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      backend_image: ${{ steps.refs.outputs.backend }}
+      frontend_image: ${{ steps.refs.outputs.frontend }}
+      # The exact value baked into this frontend image; the deploy preflight checks it against
+      # the backend's real Dokploy service name.
+      backend_url: ${{ steps.names.outputs.backend_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Image names and frontend build settings
+        id: names
+        env:
+          PRODUCTION_BACKEND_URL: ${{ vars.PRODUCTION_BACKEND_URL }}
+        run: |
+          # The frontend bakes its proxy target in at build time: the backend's PRIVATE Dokploy
+          # service name, e.g. http://hourwise-backend-abc123:8080. Not a secret.
+          bash scripts/ci/dokploy-deploy.sh validate-backend-url
+          echo "backend_url=$PRODUCTION_BACKEND_URL" >> "$GITHUB_OUTPUT"
+          echo "prefix=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push backend
+        id: backend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          provenance: false
+          tags: ${{ steps.names.outputs.prefix }}/hourwise-backend:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          build-args: HOURWISE_REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=backend
+      - name: Build and push frontend
+        id: frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: true
+          provenance: false
+          tags: ${{ steps.names.outputs.prefix }}/hourwise-frontend:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          # Build arguments only: the runtime stage keeps no BACKEND_URL variable and no secrets.
+          build-args: |
+            BACKEND_URL=${{ steps.names.outputs.backend_url }}
+            HOURWISE_REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=frontend
+      # Immutable references: the tag names the commit, the digest pins the exact image bytes.
+      - name: Release image references
+        id: refs
+        env:
+          PREFIX: ${{ steps.names.outputs.prefix }}
+          BACKEND_DIGEST: ${{ steps.backend.outputs.digest }}
+          FRONTEND_DIGEST: ${{ steps.frontend.outputs.digest }}
+        run: |
+          for d in "$BACKEND_DIGEST" "$FRONTEND_DIGEST"; do
+            [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::missing image digest"; exit 1; }
+          done
+          echo "backend=$PREFIX/hourwise-backend:sha-$GITHUB_SHA@$BACKEND_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "frontend=$PREFIX/hourwise-frontend:sha-$GITHUB_SHA@$FRONTEND_DIGEST" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Release images for \`${GITHUB_SHA:0:12}\`"
+            echo "- \`$PREFIX/hourwise-backend:sha-$GITHUB_SHA@$BACKEND_DIGEST\`"
+            echo "- \`$PREFIX/hourwise-frontend:sha-$GITHUB_SHA@$FRONTEND_DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy to production
+    needs: publish
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      vars.PRODUCTION_PIPELINE == 'deploy'
+    runs-on: ubuntu-latest
+    # Longer than the sum of the step limits below (3+5+30+7+30+14+40+2 = 131 minutes), so a slow
+    # step always fails with its own message and the rollback step still gets to run.
+    # scripts/ci/test-dokploy-deploy.mjs checks this.
+    timeout-minutes: 140
+    environment:
+      name: production
+      url: ${{ steps.preflight.outputs.app_url }}
+    # One production deploy at a time, never cancelled midway. If several merges queue up,
+    # GitHub keeps only the newest pending run; the preflight also refuses anything older than
+    # what production already runs.
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    env:
+      RELEASE_SHA: ${{ github.sha }}
+      DEPLOY: scripts/ci/dokploy-deploy.sh
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 3
+      - name: Preflight (settings, sources, auto-deploy off, revision order)
+        id: preflight
+        timeout-minutes: 5
+        env:
+          DOKPLOY_URL: ${{ secrets.DOKPLOY_URL }}
+          DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
+          DOKPLOY_BACKEND_APP_ID: ${{ secrets.DOKPLOY_BACKEND_APP_ID }}
+          DOKPLOY_FRONTEND_APP_ID: ${{ secrets.DOKPLOY_FRONTEND_APP_ID }}
+          PRODUCTION_URL: ${{ vars.PRODUCTION_URL }}
+          PRODUCTION_BACKEND_URL: ${{ needs.publish.outputs.backend_url }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash "$DEPLOY" preflight
+      - name: Deploy backend
+        id: deploy_backend
+        if: steps.preflight.outputs.decision == 'deploy'
+        timeout-minutes: 30
+        env:
+          DOKPLOY_URL: ${{ secrets.DOKPLOY_URL }}
+          DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
+          APP_ID: ${{ secrets.DOKPLOY_BACKEND_APP_ID }}
+          IMAGE: ${{ needs.publish.outputs.backend_image }}
+        run: bash "$DEPLOY" deploy backend "$APP_ID" "$IMAGE"
+      - name: Verify backend (through the public site, includes the database)
+        if: steps.preflight.outputs.decision == 'deploy'
+        timeout-minutes: 7
+        env:
+          APP_URL: ${{ steps.preflight.outputs.app_url }}
+        run: bash "$DEPLOY" verify backend "$APP_URL/api/health/ready"
+      - name: Deploy frontend
+        id: deploy_frontend
+        if: steps.preflight.outputs.decision == 'deploy'
+        timeout-minutes: 30
+        env:
+          DOKPLOY_URL: ${{ secrets.DOKPLOY_URL }}
+          DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
+          APP_ID: ${{ secrets.DOKPLOY_FRONTEND_APP_ID }}
+          IMAGE: ${{ needs.publish.outputs.frontend_image }}
+        run: bash "$DEPLOY" deploy frontend "$APP_ID" "$IMAGE"
+      - name: Verify frontend over HTTPS, then the backend through it
+        id: verify_frontend
+        if: steps.preflight.outputs.decision == 'deploy'
+        timeout-minutes: 14
+        env:
+          APP_URL: ${{ steps.preflight.outputs.app_url }}
+        run: |
+          bash "$DEPLOY" verify frontend "$APP_URL/healthz"
+          bash "$DEPLOY" verify backend "$APP_URL/api/health/ready"
+      # Runs only if the frontend was touched and something from there on failed. The backend is
+      # never rolled back automatically (migrations); see docs/CI-CD.md → Recovery.
+      - name: Roll the frontend back to the previous release
+        if: >-
+          failure() && steps.preflight.outputs.decision == 'deploy' &&
+          (steps.deploy_frontend.outcome == 'failure' || steps.verify_frontend.outcome == 'failure')
+        timeout-minutes: 40
+        env:
+          DOKPLOY_URL: ${{ secrets.DOKPLOY_URL }}
+          DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
+          APP_ID: ${{ secrets.DOKPLOY_FRONTEND_APP_ID }}
+          PREVIOUS: ${{ steps.preflight.outputs.frontend_previous }}
+          APP_URL: ${{ steps.preflight.outputs.app_url }}
+        run: bash "$DEPLOY" rollback "$APP_ID" "$PREVIOUS" "$APP_URL"
+      - name: Report failure
+        if: failure()
+        timeout-minutes: 2
+        run: |
+          {
+            echo "### Production deploy of \`${RELEASE_SHA:0:12}\` failed"
+            echo "See the failed step above and docs/CI-CD.md → Recovery. The backend is never rolled back automatically."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -33,7 +33,11 @@ RUN apt-get update \
 COPY --from=builder /app/target/release/hourwise-backend /usr/local/bin/hourwise-backend
 
 USER hourwise
-ENV BIND_ADDR=0.0.0.0:8080 \
+# Git commit of this build, reported by /api/health/ready. CI sets it (docs/CI-CD.md); other
+# builds report "unknown". Declared last so it never invalidates the cached layers above.
+ARG HOURWISE_REVISION=unknown
+ENV HOURWISE_REVISION=$HOURWISE_REVISION \
+    BIND_ADDR=0.0.0.0:8080 \
     UPLOAD_DIR=/data/uploads \
     RUST_LOG=hourwise_backend=info,tower_http=info
 EXPOSE 8080
