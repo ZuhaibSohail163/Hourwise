@@ -271,3 +271,12 @@ Dokploy at runtime, and the frontend needs none.
   commit.
 - **Third-party actions** are pinned to major versions, not commit SHAs, as in the rest of the
   workflow.
+
+## 8. Release log
+
+- **2026-11-18: first publish-only release validation.** With `PRODUCTION_PIPELINE=publish`, this
+  documentation-only change is merged to trigger the first GHCR publication (section 5, step 3).
+  Expected result: all checks pass, `publish` pushes
+  `ghcr.io/<owner>/hourwise-backend:sha-<commit>` and `ghcr.io/<owner>/hourwise-frontend:sha-<commit>`,
+  and `deploy` is skipped. Dokploy and PostgreSQL are not touched. `deploy` stays disabled until the
+  read-only API check (section 5, step 4) and the one-time setup (section 4) are done.
