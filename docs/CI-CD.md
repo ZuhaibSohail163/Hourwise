@@ -280,3 +280,12 @@ Dokploy at runtime, and the frontend needs none.
   `ghcr.io/<owner>/hourwise-backend:sha-<commit>` and `ghcr.io/<owner>/hourwise-frontend:sha-<commit>`,
   and `deploy` is skipped. Dokploy and PostgreSQL are not touched. `deploy` stays disabled until the
   read-only API check (section 5, step 4) and the one-time setup (section 4) are done.
+- **2026-11-20: first controlled production deployment.** With `PRODUCTION_PIPELINE=deploy`, merging
+  this documentation-only change runs the full pipeline for the first time: publish, then deploy
+  the backend and the frontend through the Dokploy API with digest-pinned GHCR images, replacing the
+  original pre-GHCR containers. Both apps use the Docker source with Auto Deploy off; the frontend
+  Update Config is start-first + rollback and both Swarm health checks are empty (the images' own
+  checks apply). The database and application volumes are kept as they are. Success means both
+  health endpoints report the merge commit as `revision`. The frontend's automatic rollback target
+  is the `f2c9380` image saved in Dokploy, not the pre-GHCR container; see section 6 for manual
+  recovery.
