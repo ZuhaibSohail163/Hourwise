@@ -68,7 +68,7 @@ Browser ──HTTPS──▶ Next.js frontend (:3000) ──/api, /uploads──
 - **Backend** (`backend/`): axum handlers in `src/routes/`, authentication in `src/auth.rs`, and
   database access in `src/db.rs` (an SQLx `PgPool` with typed helpers). Migrations are embedded
   in the binary and applied on startup. The same binary is a small CLI:
-  `serve | migrate | check-db | verify | healthcheck`.
+  `serve | migrate | check-db | verify | healthcheck | reset-password`.
 - **Frontend** (`frontend/`): client components calling the API through `src/lib/api.ts`. It
   sends cookies and the CSRF header automatically.
 - **Health checks:**
@@ -506,7 +506,7 @@ Errors are returned as `{"error": "message"}` with the matching HTTP status.
 │   ├── Dockerfile
 │   ├── migrations/           # PostgreSQL migrations (embedded with sqlx::migrate!)
 │   ├── src/
-│   │   ├── main.rs           # CLI: serve | migrate | check-db | verify | healthcheck
+│   │   ├── main.rs           # CLI: serve | migrate | check-db | verify | healthcheck | reset-password
 │   │   ├── lib.rs            # app + state construction (shared with tests)
 │   │   ├── db.rs             # PgPool, settings, args!, Record/FromRecord, destinations
 │   │   ├── migrate.rs        # migration runner

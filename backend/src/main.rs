@@ -8,19 +8,24 @@
 //! hourwise-backend verify          # read-only data-integrity report (exit 1 on problems)
 //! hourwise-backend healthcheck     # exit 0 if the local API answers /api/health (Docker)
 //! hourwise-backend healthcheck --ready   # same, but also requires the database (/api/health/ready)
+//! hourwise-backend reset-password <email>  # new password on stdin; signs the account out everywhere
 //! ```
+//!
+//! `reset-password` is the supported way to recover a locked-out administrator; it never runs on
+//! its own (see docs/DEPLOYMENT.md → Recovering an administrator account).
 //!
 //! Backups use PostgreSQL's own tools (`pg_dump` / `pg_restore`); see the README.
 
 use std::{process::ExitCode, time::Duration};
 
-use hourwise_backend::{config, db, migrate, verify};
+use hourwise_backend::{auth, config, db, migrate, password_reset, verify};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::EnvFilter;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: hourwise-backend [serve | migrate | check-db | verify | healthcheck [--ready]]"
+        "usage: hourwise-backend [serve | migrate | check-db | verify | healthcheck [--ready]]\n       \
+         hourwise-backend reset-password <email>   (new password on standard input)"
     );
     ExitCode::from(2)
 }
@@ -42,6 +47,7 @@ async fn main() -> ExitCode {
         "serve" => serve().await,
         "migrate" | "check-db" | "verify" => db_command(command).await,
         "healthcheck" => return healthcheck(args.get(1).is_some_and(|a| a == "--ready")).await,
+        "reset-password" => reset_password(&args[1..]).await,
         "-h" | "--help" | "help" => {
             // Print the usage text, but asking for help is a success (exit 0), not an error (2).
             let _ = usage();
@@ -144,6 +150,56 @@ async fn db_command(command: &str) -> Result<ExitCode, String> {
         _ => return Ok(usage()),
     }
     database.close().await;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `reset-password <email>`: reads the new password from stdin (one line), then updates only that
+/// account in one transaction. Prints the outcome, never the password, the hash or credentials.
+async fn reset_password(rest: &[String]) -> Result<ExitCode, String> {
+    use std::io::{IsTerminal, Read};
+
+    let [email] = rest else {
+        eprintln!(
+            "usage: hourwise-backend reset-password <email>\n\
+             The new password is read from standard input, never from an argument."
+        );
+        return Ok(ExitCode::from(2));
+    };
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return Err("refusing to read a password typed into this terminal (it would be shown). \
+                    Pipe it in instead; see docs/DEPLOYMENT.md → Recovering an administrator account"
+            .into());
+    }
+    let mut input = Vec::new();
+    stdin
+        .lock()
+        .take(password_reset::MAX_INPUT_BYTES as u64 + 1)
+        .read_to_end(&mut input)
+        .map_err(|e| format!("cannot read standard input: {e}"))?;
+    let password = password_reset::password_from_input(&input);
+    input.fill(0);
+    let password = password?;
+    // Fail fast, before connecting; `reset_password` checks again for its other callers.
+    auth::validate_password(&password).map_err(|e| e.detail())?;
+
+    // The same DATABASE_URL as the server. No migrations: this only updates an existing row.
+    let settings = config::database_from_env()?;
+    eprintln!("database: {}", settings.describe());
+    let database = db::connect_with_retry(&settings, 3)
+        .await
+        .map_err(|e| format!("cannot connect: {}", e.detail()))?;
+    let result = password_reset::reset_password(&database, email, password).await;
+    database.close().await;
+    let outcome = result.map_err(|e| format!("{}; nothing was changed", e.detail()))?;
+
+    eprintln!(
+        "password reset for {} (role: {}); every existing session of this account is signed out",
+        outcome.email, outcome.role
+    );
+    if !outcome.is_active {
+        eprintln!("note: this account is deactivated, so it still cannot sign in");
+    }
     Ok(ExitCode::SUCCESS)
 }
 

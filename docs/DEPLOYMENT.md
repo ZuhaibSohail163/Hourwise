@@ -174,6 +174,8 @@ RUST_LOG=hourwise_backend=info,tower_http=info
 - Leave `CORS_ORIGIN` **unset**: the browser never calls the backend directly.
 - The admin account is created on first start only if no admin exists. After your first login,
   change the password in the app and you may remove `ADMIN_PASSWORD` from the environment.
+  Changing `ADMIN_PASSWORD` later does **not** change an existing password; to recover a locked-out
+  admin, see [Recovering an administrator account](#recovering-an-administrator-account).
 - `PASSWORD_HASH_CONCURRENCY` caps simultaneous Argon2 operations (~19 MB each). 4 suits a
   2–4 GB server. When all slots are busy for 5 seconds, a login gets `503` ("The server is busy")
   instead of using up memory.
@@ -492,3 +494,46 @@ Deploy off** on both apps, so nothing else deploys. The pipeline refuses to run 
 | `503 The server is busy` on login | All `PASSWORD_HASH_CONCURRENCY` slots were busy for 5 s (a login burst or an attack). It recovers by itself. Raise the value only if the server has spare memory and CPU. |
 | Deploy succeeded but the app isn't running | An invalid mount or health check. Check the application's Swarm/Logs section. The Dokploy docs note Swarm silently refuses invalid mounts. |
 | Avatars disappear after a redeploy | The `/data/uploads` volume mount is missing. |
+| Admin login says "Invalid credentials" and no admin can sign in | Changing `ADMIN_PASSWORD` has no effect once an admin exists. Use `reset-password`, below. |
+
+### Recovering an administrator account
+
+`hourwise-backend reset-password <email>` sets a new password for one existing account. It is
+the supported recovery when no admin can sign in. It never runs on its own (not at startup, not
+during a deploy), and there is no web endpoint for it.
+
+- It reads the new password from **standard input** (one line), never from an argument, so the
+  password stays out of shell history and the process list. It refuses a terminal: pipe it in.
+- It applies the app's password rules (at least 8 characters) and its Argon2id settings.
+- It changes only that account's `password_hash`, `updated_at` and `session_epoch`, in one
+  transaction that must change exactly one row. Increasing `session_epoch` signs that account
+  out everywhere. Role, active status, projects and time entries are untouched. A deactivated
+  account stays deactivated.
+- It uses the container's own `DATABASE_URL` and needs no migration. On any error (unknown
+  email, invalid or empty password, database failure) nothing is changed.
+- It prints only the database's `user@host:port/db`, the email and the role: never the
+  password, the hash or credentials.
+
+**Run it on the server** (SSH to the VPS that runs the backend). The Swarm service name is the
+backend application's **app name** in Dokploy (e.g. `hourwise-backend-xxxxxx`, the same name as
+in `PRODUCTION_BACKEND_URL`):
+
+```bash
+SERVICE=<backend app name>
+CONTAINER="$(docker ps -q --filter "label=com.docker.swarm.service.name=$SERVICE" | head -n1)"
+[ -n "$CONTAINER" ] || echo "no running container for $SERVICE"
+
+read -rsp 'New password: ' PW; echo
+read -rsp 'Repeat it: ' PW2; echo
+if [ "$PW" = "$PW2" ]; then
+  printf '%s\n' "$PW" | docker exec -i "$CONTAINER" hourwise-backend reset-password admin@example.com
+else
+  echo "the passwords differ; nothing was changed"
+fi
+unset PW PW2
+```
+
+Use `docker exec -i` (not `-it`). Expected output:
+`password reset for admin@example.com (role: admin); every existing session of this account is
+signed out`. Then sign in with the new password, change it from your profile if you like, and
+remove `ADMIN_PASSWORD` from the backend's environment if it is still set.
