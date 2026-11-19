@@ -12,7 +12,8 @@ Hourwise is a team time-tracking web app (Harvest-like). There are two roles:
 ## Layout
 - `backend/`: Rust API (axum 0.8, **SQLx 0.8 + PostgreSQL**, argon2, jsonwebtoken). It's a lib + bin
   crate: `src/lib.rs` builds the app and state (shared with the tests); `src/main.rs` is the CLI
-  (`serve | migrate | check-db | verify | healthcheck [--ready]`).
+  (`serve | migrate | check-db | verify | healthcheck [--ready] | reset-password <email>`;
+  `src/password_reset.rs`: admin recovery, password on stdin only, never run automatically).
   - `src/db.rs`: `Db` (a `PgPool`; one pooled connection per request via `state.db.conn()`),
     `DbSettings` (`DATABASE_URL` + pool limits; the password never appears in Debug or logs), the
     `args![]` macro, `Record` row accessors, `FromRecord`, `query_all/opt/one/scalar/i64`, `execute`,
@@ -33,7 +34,7 @@ Hourwise is a team time-tracking web app (Harvest-like). There are two roles:
     The login limiter is keyed per email+IP and per IP, never per email alone (that would allow lockout abuse).
   - `migrations/`: PostgreSQL SQL, embedded in the binary.
   - `tests/`: `common/mod.rs` (TestApp harness: a fresh database per test on the disposable test
-    server, cookie sessions, production guard), `db.rs`, `api.rs`, `security.rs`.
+    server, cookie sessions, production guard), `db.rs`, `api.rs`, `security.rs`, `password_reset.rs`.
 - `frontend/`: Next.js 16 App Router, React 19, TypeScript, Tailwind CSS v4 (configured in CSS with `@theme` in `globals.css`).
   - `src/app/(app)/` is the member interface (top nav). `src/app/admin/` is the admin interface (dark sidebar). Each `layout.tsx` guards its own role. `src/app/healthz/route.ts` is the liveness probe.
   - All pages are client components that call the API through `src/lib/api.ts` (`api<T>(path, {method, body, query, form})`).

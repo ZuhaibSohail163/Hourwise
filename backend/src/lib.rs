@@ -8,6 +8,7 @@ pub mod db;
 pub mod error;
 pub mod migrate;
 pub mod models;
+pub mod password_reset;
 pub mod routes;
 pub mod verify;
 
